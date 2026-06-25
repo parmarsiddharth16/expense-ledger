@@ -1,13 +1,10 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 
-async function init() {
-  const { default: ExpenseLedger } = await import("../ExpenseLedger.jsx");
-  ReactDOM.createRoot(document.getElementById("root")).render(
-    <React.StrictMode>
-      <ExpenseLedger />
-    </React.StrictMode>
-  );
-}
+const ExpenseLedger = React.lazy(() => import("../ExpenseLedger.jsx"));
 
-init();
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <React.Suspense fallback={<div style={{padding:"2rem"}}>Loading…</div>}>
+    <ExpenseLedger />
+  </React.Suspense>
+);
