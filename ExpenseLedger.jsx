@@ -992,6 +992,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
   const [personAssign, setPersonAssign] = useState({});
   const dupKey = (date, amount, desc) => `${date}|${Math.round(amount)}|${normMerchant(desc)}`;
   const existingKeys = useMemo(() => new Set((existing || []).map((e) => dupKey(e.date, e.amount, e.note))), [existing]);
+  const catById = useMemo(() => Object.fromEntries((categories || []).map((c) => [c.id, c])), [categories]);
 
   const toReview = (out, fromAPI) => {
     if (!out.length) { setErr("No expense transactions were found. For tabular files, check the column mapping; for PDFs, try a clearer copy or a CSV/Excel export."); if (fromAPI) setStep("upload"); return; }
@@ -1751,10 +1752,9 @@ function Styles() {
   .rev-row .catsel{grid-column:1 / -1; padding-left:26px;}
 }
 @media (prefers-reduced-motion:reduce){ .seg,.usebar-fill{transition:none;} }
-`}
 .en-bank{font-size:11px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .person-row{display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:4px;}
 .person-btn{border:1px solid var(--border);border-radius:12px;padding:2px 8px;font-size:11px;cursor:pointer;background:transparent;color:var(--ink);line-height:1.6;}
 .person-btn.on{background:var(--teal);color:#fff;border-color:var(--teal);}
-</style>);
+`}</style>);
 }
