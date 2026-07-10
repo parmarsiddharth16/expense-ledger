@@ -2,10 +2,10 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
 import {
   ChevronLeft, ChevronRight, Plus, Trash2, SlidersHorizontal, X,
   TriangleAlert, Check, Wallet, ArrowUpRight, Sparkles, Eye, EyeOff,
-  Upload, FileSpreadsheet, ArrowRight, Search, Info
+  Upload, FileSpreadsheet, ArrowRight, Search, Info, BarChart2, Pencil
 } from "lucide-react";
 import {
-  ComposedChart, Bar, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, Legend
+  ComposedChart, BarChart, Bar, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, Legend
 } from "recharts";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
@@ -45,43 +45,73 @@ const SECTIONS = [
   "Household Fixed", "Utilities", "Personal", "Lifestyle",
   "Shopping", "Annual", "Insurance", "LIC Policies",
 ];
+/* Categories that require a person tag when logging */
+const PERSON_CATS = new Set([
+  "Medical", "Mobile", "Holiday", "Food & Travel",
+  "Entertainment", "Shopping", "Parlour",
+]);
+/* Old category names → new names (for data migration on reseed) */
+const LEGACY_NAMES = {
+  // v2→v3
+  "Manali Recharge Mobile": "Mobile",
+  "Gotu & SRP Mobile": "Mobile",
+  "Self Food & Travel (Sid)": "Food & Travel",
+  "Spouse F&T (SRP)": "Food & Travel",
+  "Family F&T": "Food & Travel",
+  "Sid Gifts": "Gifts",
+  "MN Shopping": "Shopping",
+  "SRP Shopping": "Shopping",
+  "Shopping Sid": "Shopping",
+  "Parlour Mom & Sid": "Parlour",
+  // v4→v5
+  "Society Maint. Manhar": "Maintenance Manhar",
+  "Society Maint. Panchamrut": "Maintenance Panchamrut",
+  "Cook / Caretaker": "Caretaker",
+  "Utilities (Bai)": "Cook",
+  "Manali's Allowance": "Allowance",
+  "House-Hold / Interior": "Household",
+  "Subscription OTT + TOI": "Subscription OTT",
+};
 
 /* [name, section, recurring, planner order Apr..Mar] */
 const SEED = [
+  // Household Fixed — fixed costs of running the home
   ["EMI", "Household Fixed", true, flat(120850)],
-  ["Laundry", "Household Fixed", true, flat(1000)],
   ["Grocery", "Household Fixed", true, flat(18000)],
-  ["Electricity Manhar", "Utilities", true, flat(2500)],
-  ["WiFi / Cable", "Utilities", true, flat(1250)],
-  ["Gas Manhar", "Utilities", true, flat(625)],
-  ["Society Maint. Manhar", "Utilities", true, flat(7500)],
-  ["Society Maint. Panchamrut", "Utilities", true, [2600,2600,2600,2600,2600,2600,2600,1800,1800,1800,1800,1800]],
-  ["Utilities (Bai)", "Utilities", true, flat(5500)],
-  ["Cook / Caretaker", "Utilities", true, flat(16500)],
+  ["Maintenance Panchamrut", "Household Fixed", true, [2600,2600,2600,2600,2600,2600,2600,1800,1800,1800,1800,1800]],
+  ["Electricity Manhar", "Household Fixed", true, flat(2500)],
+  ["WiFi / Cable", "Household Fixed", true, flat(1250)],
+  ["Gas Manhar", "Household Fixed", true, flat(625)],
+  ["Maintenance Manhar", "Household Fixed", true, flat(7500)],
+  // Utilities — household help & consumables
+  ["Cook", "Utilities", true, flat(5000)],
+  ["Caretaker", "Utilities", true, flat(16500)],
+  ["Laundry", "Utilities", true, flat(1000)],
   ["Flower", "Utilities", true, flat(250)],
-  ["Manali's Allowance", "Personal", true, flat(15000)],
-  ["Manali Recharge Mobile", "Personal", true, flat(334)],
-  ["Gotu & SRP Mobile", "Personal", true, flat(834)],
-  ["Parlour Mom & Sid", "Personal", true, flat(650)],
+  // Personal
+  ["Allowance", "Personal", true, flat(15000)],
   ["Medical", "Personal", true, flat(5000)],
+  ["Mobile", "Personal", true, flat(1000)],
+  ["Parlour", "Personal", true, flat(5000)],
   ["Bike", "Personal", true, flat(2000)],
+  // Lifestyle
+  ["Food & Travel", "Lifestyle", true, flat(20000)],
   ["Entertainment", "Lifestyle", true, flat(2100)],
-  ["Self Food & Travel (Sid)", "Lifestyle", true, flat(8000)],
-  ["Spouse F&T (SRP)", "Lifestyle", true, flat(7000)],
-  ["Family F&T", "Lifestyle", true, flat(5000)],
-  ["House-Hold / Interior", "Lifestyle", true, flat(10000)],
+  ["Subscription OTT", "Lifestyle", true, flat(1000)],
+  ["Household", "Lifestyle", true, flat(10000)],
   ["Holiday", "Lifestyle", true, flat(40000)],
-  ["Sid Gifts", "Lifestyle", true, flat(2500)],
+  ["Gifts", "Lifestyle", true, flat(2500)],
   ["Yoga / Gym", "Lifestyle", true, flat(5000)],
-  ["Subscription OTT + TOI", "Lifestyle", true, flat(1000)],
-  ["MN Shopping", "Shopping", true, [10500,3500,10500,3500,7000,3500,5600,5600,5600,3500,4200,7000]],
-  ["SRP Shopping", "Shopping", true, [3600,1200,6000,1200,3000,1500,2400,2400,3600,1200,1500,2400]],
-  ["Shopping Sid", "Shopping", true, [6000,2500,6000,2500,5000,2500,6000,2500,5000,2500,2500,7000]],
+  // Shopping — merged MN + SRP + Sid budgets
+  ["Shopping", "Shopping", true, [20100,7200,22500,7200,15000,7500,14000,10500,14200,7200,8200,16400]],
+  // Annual
   ["Property Tax - Manhar", "Annual", false, at(6, 18824)],
   ["Locker Rent (SBI)", "Annual", false, at(5, 4000)],
+  // Insurance
   ["Health Ins. Mom", "Insurance", false, at(9, 91680)],
   ["Health Ins. Sid", "Insurance", false, at(1, 9876)],
   ["Health Ins. Manali", "Insurance", false, at(1, 11439)],
+  // LIC Policies
   ["991927505 - LIC", "LIC Policies", false, at(8, 2705)],
   ["991927507 - LIC", "LIC Policies", false, at(8, 3224)],
   ["991927510 - LIC", "LIC Policies", false, at(8, 3696)],
@@ -102,8 +132,18 @@ const store = {
   async set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { console.error(e); } },
 };
 const K_CATS = "ledger:categories", K_EXP = "ledger:expenses", K_SET = "ledger:settings", K_INC = "ledger:income";
-const K_MAP = "ledger:merchantMap";
-const CAT_VERSION = 3;
+const K_MAP = "ledger:merchantMap", K_STMTS = "ledger:stmts";
+const CAT_VERSION = 5;
+
+const BANKS = [
+  { key: "hdfc_regalia",  label: "HDFC Regalia CC",       auto: false },
+  { key: "hdfc_solitaire",label: "HDFC Solitaire CC",      auto: false },
+  { key: "bom",           label: "Bank of Maharashtra",    auto: true  },
+  { key: "ubi",           label: "Union Bank of India",    auto: true  },
+  { key: "hdfc_bank",     label: "HDFC Bank (Savings)",    auto: true  },
+  { key: "sbi_srp",       label: "SBI SRP",                auto: false },
+  { key: "sbi_sid",       label: "SBI Sid",                auto: false },
+];
 
 const mIdx = (k) => Number(k.slice(5, 7)) - 1;
 const inFY = (k) => k >= FY_START && k <= FY_END;
@@ -130,11 +170,19 @@ export default function ExpenseLedger() {
   const [importOpen, setImportOpen] = useState(false);
   const [merchantMap, setMerchantMap] = useState({});
   const [hideEmpty, setHideEmpty] = useState(true);
+  const [stmts, setStmts] = useState({});
 
   const [fCat, setFCat] = useState("");
   const [fAmt, setFAmt] = useState("");
   const [fDate, setFDate] = useState(todayISO());
   const [fNote, setFNote] = useState("");
+  const [fPerson, setFPerson] = useState([]);
+  const [catPersonMap, setCatPersonMap] = useState(() => { try { return JSON.parse(localStorage.getItem("ledger:catPersonMap") || "{}"); } catch { return {}; } });
+  const [addedFlash, setAddedFlash] = useState(false);
+  const [reportFlash, setReportFlash] = useState(false);
+  const [view, setView] = useState("dashboard");
+  const [editingId, setEditingId] = useState(null);
+  const [editForm, setEditForm] = useState({});
 
   /* ---- load once (with name-based expense remap on reseed) ---- */
   useEffect(() => {
@@ -145,6 +193,7 @@ export default function ExpenseLedger() {
       let exps = (await store.get(K_EXP)) || [];
       const settings = (await store.get(K_SET)) || {};
       const mmap = (await store.get(K_MAP)) || {};
+      const stmtsData = (await store.get(K_STMTS)) || {};
 
       if (ver !== CAT_VERSION || !cats || !cats.length) {
         const oldName = {};
@@ -155,7 +204,9 @@ export default function ExpenseLedger() {
         if (exps.length) {
           exps = exps.map((e) => {
             const nm = oldName[e.cat];
-            return nm && byName[nm] ? { ...e, cat: byName[nm] } : e;
+            if (!nm) return e;
+            const newId = byName[nm] || byName[LEGACY_NAMES[nm]];
+            return newId ? { ...e, cat: newId } : e;
           });
           await store.set(K_EXP, exps);
         }
@@ -171,6 +222,7 @@ export default function ExpenseLedger() {
       setIncome(inc);
       setExpenses(exps);
       setMerchantMap(mmap);
+      setStmts(stmtsData);
       setSym(settings.sym || "₹");
       setLoading(false);
     })();
@@ -180,6 +232,7 @@ export default function ExpenseLedger() {
   const saveInc = useCallback((n) => { setIncome(n); store.set(K_INC, n); }, []);
   const saveExps = useCallback((n) => { setExpenses(n); store.set(K_EXP, n); }, []);
   const saveSym = useCallback((s) => { setSym(s); store.set(K_SET, { sym: s }); }, []);
+  const saveStmts = useCallback((n) => { setStmts(n); store.set(K_STMTS, n); }, []);
 
   useEffect(() => { if (!fCat && categories.length) setFCat(categories[0].id); }, [categories, fCat]);
 
@@ -258,15 +311,80 @@ export default function ExpenseLedger() {
   const addExpense = () => {
     const amt = parseFloat(fAmt);
     if (!fCat || !amt || amt <= 0 || !fDate) return;
-    saveExps([{ id: uid(), cat: fCat, amount: amt, date: fDate, note: fNote.trim() }, ...expenses]);
-    setFAmt(""); setFNote("");
+    const personStr = fPerson.join(",");
+    const entry = { id: uid(), cat: fCat, amount: amt, date: fDate, note: fNote.trim() };
+    if (personStr) entry.person = personStr;
+    saveExps([entry, ...expenses]);
+    if (fPerson.length > 0) {
+      const next = { ...catPersonMap, [fCat]: fPerson };
+      setCatPersonMap(next);
+      try { localStorage.setItem("ledger:catPersonMap", JSON.stringify(next)); } catch {}
+    }
+    setFAmt(""); setFNote(""); setFPerson([]);
+    setAddedFlash(true); setTimeout(() => setAddedFlash(false), 1600);
     if (fDate.slice(0, 7) !== selMonth) setSelMonth(fDate.slice(0, 7));
   };
   const delExpense = (id) => saveExps(expenses.filter((e) => e.id !== id));
 
-  const onImport = (newExpenses, newMap) => {
+  const startEdit = (e) => {
+    setEditingId(e.id);
+    setEditForm({ cat: e.cat, amount: String(e.amount), date: e.date, note: e.note || "", person: e.person || "" });
+  };
+  const cancelEdit = () => setEditingId(null);
+  const saveEdit = () => {
+    const amt = parseFloat(editForm.amount);
+    if (!editForm.cat || !amt || amt <= 0 || !editForm.date) return;
+    saveExps(expenses.map((e) => e.id === editingId
+      ? { ...e, cat: editForm.cat, amount: amt, date: editForm.date, note: editForm.note.trim(), ...(editForm.person ? { person: editForm.person } : { person: undefined }) }
+      : e
+    ));
+    setEditingId(null);
+  };
+
+  const generateReport = () => {
+    const fmt = (n) => sym + inr.format(Math.round(Math.abs(n || 0)));
+    const mo = monthLabel(selMonth, { month: "long", year: "numeric" });
+    const lines = [
+      `📊 *Manali's Ledger — ${mo}*`,
+      "",
+      `💰 Income: ${fmt(totalIncome)}`,
+      `📋 Budgeted: ${fmt(totalBudget)}`,
+      `💸 Spent: ${fmt(totalSpent)}`,
+      `🏦 Saved: ${fmt(net)} (${savingsRate.toFixed(0)}%)`,
+      "",
+      "*Category breakdown:*",
+    ];
+    grouped.forEach((g) => {
+      const pct = g.budget > 0 ? Math.round((g.spent / g.budget) * 100) : null;
+      const flag = g.spent > g.budget && g.budget > 0 ? " ⚠️" : "";
+      lines.push(`  *${g.section}* — ${fmt(g.spent)}${g.budget > 0 ? ` / ${fmt(g.budget)} (${pct}%)` : ""}${flag}`);
+      g.rows.filter((r) => r.spent > 0).forEach((r) => {
+        const rPct = r.budget > 0 ? Math.round((r.spent / r.budget) * 100) : null;
+        const rFlag = r.status === "over" ? " 🔴" : r.status === "caution" ? " 🟡" : "";
+        lines.push(`    • ${r.name}: ${fmt(r.spent)}${r.budget > 0 ? ` / ${fmt(r.budget)} (${rPct}%)` : ""}${rFlag}`);
+      });
+    });
+    if (overRows.length > 0) {
+      lines.push("", `*⚠️ Over budget in ${overRows.length} categor${overRows.length === 1 ? "y" : "ies"}:*`);
+      overRows.forEach((r) => lines.push(`  • ${r.name}: ${fmt(r.spent - r.budget)} over`));
+    }
+    lines.push("", `_Generated by Manali's Ledger · ${new Date().toLocaleDateString("en-IN")}_`);
+    const text = lines.join("\n");
+    try {
+      navigator.clipboard.writeText(text).then(() => {
+        setReportFlash(true); setTimeout(() => setReportFlash(false), 2500);
+      });
+    } catch { alert(text); }
+  };
+
+  const onImport = (newExpenses, newMap, bankSource) => {
     saveExps([...newExpenses, ...expenses]);
     if (newMap) { setMerchantMap(newMap); store.set(K_MAP, newMap); }
+    if (bankSource && newExpenses[0]?.date) {
+      const mk = newExpenses[0].date.slice(0, 7);
+      const cur = stmts[mk] || [];
+      if (!cur.includes(bankSource)) saveStmts({ ...stmts, [mk]: [...cur, bankSource] });
+    }
     setImportOpen(false);
     if (newExpenses[0]?.date) setSelMonth(newExpenses[0].date.slice(0, 7));
   };
@@ -302,15 +420,15 @@ export default function ExpenseLedger() {
       ["Grocery", 4200, 4, "DMart stock-up"],
       ["Grocery", 3800, 17, "Vegetables + dairy"],
       ["Grocery", 11500, 27, "Festive groceries"],
-      ["Self Food & Travel (Sid)", 9200, 9, "Work travel + meals"],
-      ["Family F&T", 6400, 14, "Weekend outing"],
+      ["Food & Travel", 9200, 9, "Work travel + meals"],
+      ["Food & Travel", 6400, 14, "Weekend outing"],
       ["Medical", 5600, 11, "Consultation + pharmacy"],
       ["Holiday", 38000, 20, "Goa trip advance"],
-      ["Shopping Sid", 7200, 22, "Clothes"],
-      ["MN Shopping", 3500, 6, "Home items"],
+      ["Shopping", 7200, 22, "Clothes"],
+      ["Shopping", 3500, 6, "Home items"],
       ["Entertainment", 2400, 13, "Movie + dinner"],
       ["Bike", 1800, 8, "Servicing"],
-      ["Parlour Mom & Sid", 900, 16, "Salon"],
+      ["Parlour", 900, 16, "Salon"],
     ];
     const sample = raw
       .filter((r) => find(r[0]))
@@ -330,7 +448,7 @@ export default function ExpenseLedger() {
         <div className="mast-title">
           <span className="mast-mark"><Wallet size={18} strokeWidth={2.2} /></span>
           <div>
-            <h1>The Ledger</h1>
+            <h1>Manali's Ledger</h1>
             <p>FY 2026–27 · budget vs. spend, month by month</p>
           </div>
         </div>
@@ -342,19 +460,66 @@ export default function ExpenseLedger() {
           </div>
           <button className="btn-ghost" onClick={() => setImportOpen(true)}><Upload size={15} /> Import</button>
           <button className="btn-ghost" onClick={() => setManageOpen(true)}><SlidersHorizontal size={15} /> Budgets</button>
+          <button className={`btn-ghost${view === "analysis" ? " btn-ghost-active" : ""}`} onClick={() => setView(v => v === "analysis" ? "dashboard" : "analysis")}><BarChart2 size={15} /> Analysis</button>
+          <button className={`btn-ghost${reportFlash ? " btn-ghost-active" : ""}`} onClick={generateReport}><ArrowUpRight size={15} /> {reportFlash ? "Copied! 🎉" : "Share"}</button>
         </div>
       </header>
 
+      {/* log */}
+      <section className="panel logbar">
+        <div className="panel-head"><h2>Log an expense</h2></div>
+        <div className="logform">
+          <select value={fCat} onChange={(e) => {
+            const id = e.target.value; setFCat(id);
+            const saved = catPersonMap[id]; setFPerson(saved ? [...saved] : []);
+          }} aria-label="Category">
+            {SECTIONS.map((sec) => {
+              const opts = categories.filter((c) => c.section === sec);
+              if (!opts.length) return null;
+              return (<optgroup key={sec} label={sec}>{opts.map((c) => (<option key={c.id} value={c.id}>{c.name}</option>))}</optgroup>);
+            })}
+            {categories.some((c) => !SECTIONS.includes(c.section)) && (
+              <optgroup label="Other">{categories.filter((c) => !SECTIONS.includes(c.section)).map((c) => (<option key={c.id} value={c.id}>{c.name}</option>))}</optgroup>
+            )}
+          </select>
+          <div className="amt-input"><span>{sym.trim()}</span>
+            <input type="number" min="0" placeholder="Amount" value={fAmt} onChange={(e) => setFAmt(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addExpense()} />
+          </div>
+          <input type="date" value={fDate} onChange={(e) => setFDate(e.target.value)} aria-label="Date" />
+          <input type="text" placeholder="Note (optional)" value={fNote} onChange={(e) => setFNote(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addExpense()} />
+          <button className={`btn-add${addedFlash ? " flash" : ""}`} onClick={addExpense}><Plus size={16} /> {addedFlash ? "Saved!" : "Add"}</button>
+          {catById[fCat] && PERSON_CATS.has(catById[fCat]?.name) && (
+            <div className="person-row">
+              <span className="person-label">For:</span>
+              {["Sid", "Manali", "Saryu"].map((p) => (
+                <button key={p} type="button"
+                  className={`person-btn${fPerson.includes(p) ? " on" : ""}`}
+                  onClick={() => setFPerson((prev) => prev.includes(p) ? prev.filter((x) => x !== p) : [...prev, p])}>
+                  {p}
+                </button>
+              ))}
+              {fPerson.length > 1 && <span className="split-hint">split {fPerson.length} ways</span>}
+            </div>
+          )}
+        </div>
+      </section>
+
+      <StatementStatus stmts={stmts} selMonth={selMonth} onToggle={(key) => {
+        const cur = stmts[selMonth] || [];
+        const next = cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key];
+        saveStmts({ ...stmts, [selMonth]: next });
+      }} />
+
       {/* summary strip */}
       <section className="strip">
-        <Stat label="Income" value={money(totalIncome, sym)} accent="teal" />
         <Stat label="Budgeted" value={money(totalBudget, sym)} />
         <Stat label="Spent" value={money(totalSpent, sym)} accent={usedPct > 100 ? "red" : "ink"} />
+        <Stat label="Remaining" value={moneySigned(remaining, sym)} accent={remaining < 0 ? "red" : "teal"} />
         <Stat
           label={net < 0 ? "Overspent" : "Net saved"}
           value={moneySigned(net, sym)}
           accent={net < 0 ? "red" : "teal"}
-          sub={totalIncome > 0 ? `${savingsRate.toFixed(0)}% of income` : null}
+          sub={totalIncome > 0 ? `${savingsRate.toFixed(0)}% savings rate` : null}
         />
       </section>
 
@@ -375,6 +540,9 @@ export default function ExpenseLedger() {
         </div>
       )}
 
+      {view === "analysis" ? (
+        <AnalysisView grouped={grouped} sym={sym} selMonth={selMonth} />
+      ) : (<>
       <div className="grid">
         {/* ledger */}
         <section className="panel ledger-panel">
@@ -441,22 +609,17 @@ export default function ExpenseLedger() {
           <section className="panel">
             <div className="panel-head"><h2>Cash flow · {monthLabel(selMonth, { month: "short", year: "numeric" })}</h2></div>
             <div className="cf">
-              {income.map((l) => (
-                <div className="cf-line" key={l.id}>
-                  <span>{l.name}</span><span className="num">{money(l.monthly[mIdx(selMonth)] || 0, sym)}</span>
-                </div>
-              ))}
-              <div className="cf-line cf-total"><span>Total income</span><span className="num">{money(totalIncome, sym)}</span></div>
-              <div className="cf-line"><span>Less: spent</span><span className="num fig-over">− {money(totalSpent, sym)}</span></div>
+              <div className="cf-line"><span>Budget</span><span className="num">{money(totalBudget, sym)}</span></div>
+              <div className="cf-line"><span>Spent</span><span className="num fig-over">− {money(totalSpent, sym)}</span></div>
               <div className="cf-line cf-net">
-                <span>{net < 0 ? "Net shortfall" : "Net saved"}</span>
-                <span className={`num ${net < 0 ? "fig-over" : "fig-good"}`}>{moneySigned(net, sym)}</span>
+                <span>{remaining < 0 ? "Over budget" : "Remaining"}</span>
+                <span className={`num ${remaining < 0 ? "fig-over" : "fig-good"}`}>{money(remaining, sym)}</span>
               </div>
-              <div className="cf-line cf-rate">
-                <span>Savings rate</span>
-                <span className="num">{totalIncome > 0 ? `${savingsRate.toFixed(0)}%` : "—"}</span>
-              </div>
-              <p className="cf-note">If you spend exactly to budget this month, you'd save {moneySigned(plannedNet, sym)}.</p>
+              <p className="cf-note">
+                {remaining >= 0
+                  ? `${money(remaining, sym)} left in this month's budget.`
+                  : `Over budget by ${money(-remaining, sym)} this month.`}
+              </p>
             </div>
           </section>
 
@@ -495,29 +658,6 @@ export default function ExpenseLedger() {
         </aside>
       </div>
 
-      {/* log */}
-      <section className="panel logbar">
-        <div className="panel-head"><h2>Log an expense</h2></div>
-        <div className="logform">
-          <select value={fCat} onChange={(e) => setFCat(e.target.value)} aria-label="Category">
-            {SECTIONS.map((sec) => {
-              const opts = categories.filter((c) => c.section === sec);
-              if (!opts.length) return null;
-              return (<optgroup key={sec} label={sec}>{opts.map((c) => (<option key={c.id} value={c.id}>{c.name}</option>))}</optgroup>);
-            })}
-            {categories.some((c) => !SECTIONS.includes(c.section)) && (
-              <optgroup label="Other">{categories.filter((c) => !SECTIONS.includes(c.section)).map((c) => (<option key={c.id} value={c.id}>{c.name}</option>))}</optgroup>
-            )}
-          </select>
-          <div className="amt-input"><span>{sym.trim()}</span>
-            <input type="number" min="0" placeholder="Amount" value={fAmt} onChange={(e) => setFAmt(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addExpense()} />
-          </div>
-          <input type="date" value={fDate} onChange={(e) => setFDate(e.target.value)} aria-label="Date" />
-          <input type="text" placeholder="Note (optional)" value={fNote} onChange={(e) => setFNote(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addExpense()} />
-          <button className="btn-add" onClick={addExpense}><Plus size={16} /> Add</button>
-        </div>
-      </section>
-
       {/* entries */}
       <section className="panel">
         <div className="panel-head">
@@ -528,32 +668,60 @@ export default function ExpenseLedger() {
           <div className="empty">No expenses logged for this month yet.</div>
         ) : (
           <ul className="entries">
-            {monthExpenses.slice().sort((a, b) => b.date.localeCompare(a.date)).map((e) => (
-              <li key={e.id}>
-                <span className="en-date num">{e.date.slice(8, 10)} {monthLabel(e.date.slice(0, 7), { month: "short" })}</span>
-                <span className="en-cat">{catById[e.cat]?.name || "Uncategorised"}</span>
-                <span className="en-note">{e.note || "—"}</span>
-                <span className="en-amt num">{money(e.amount, sym)}</span>
-                <button className="en-del" aria-label="Delete entry" onClick={() => delExpense(e.id)}><Trash2 size={14} /></button>
-              </li>
-            ))}
+            {monthExpenses.slice().sort((a, b) => b.date.localeCompare(a.date)).map((e) => {
+              if (editingId === e.id) {
+                return (
+                  <li key={e.id} className="en-edit">
+                    <select className="en-edit-cat" value={editForm.cat} onChange={(ev) => setEditForm({ ...editForm, cat: ev.target.value })}>
+                      {SECTIONS.map((sec) => {
+                        const opts = categories.filter((c) => c.section === sec);
+                        if (!opts.length) return null;
+                        return (<optgroup key={sec} label={sec}>{opts.map((c) => (<option key={c.id} value={c.id}>{c.name}</option>))}</optgroup>);
+                      })}
+                    </select>
+                    <div className="amt-input sm en-edit-amt">
+                      <span>{sym.trim()}</span>
+                      <input type="number" min="0" value={editForm.amount} onChange={(ev) => setEditForm({ ...editForm, amount: ev.target.value })} />
+                    </div>
+                    <input className="en-edit-date" type="date" value={editForm.date} onChange={(ev) => setEditForm({ ...editForm, date: ev.target.value })} />
+                    <input className="en-edit-note" type="text" placeholder="Note" value={editForm.note} onChange={(ev) => setEditForm({ ...editForm, note: ev.target.value })} onKeyDown={(ev) => ev.key === "Enter" && saveEdit()} />
+                    <div className="en-edit-btns">
+                      <button className="icon-btn" aria-label="Save" onClick={saveEdit}><Check size={14} strokeWidth={2.5} style={{ color: "var(--teal)" }} /></button>
+                      <button className="icon-btn" aria-label="Cancel" onClick={cancelEdit}><X size={14} /></button>
+                    </div>
+                  </li>
+                );
+              }
+              return (
+                <li key={e.id}>
+                  <span className="en-date num">{e.date.slice(8, 10)} {monthLabel(e.date.slice(0, 7), { month: "short" })}</span>
+                  <span className="en-cat">{catById[e.cat]?.name || "Uncategorised"}</span>
+                  <span className="en-note">{e.note || "—"}{e.person && e.person.split(",").map((p) => <span key={p} className="person-tag">{p}</span>)}</span>
+                  <span className="en-amt num">{money(e.amount, sym)}</span>
+                  <button className="en-del" aria-label="Edit entry" onClick={() => startEdit(e)}><Pencil size={13} /></button>
+                  <button className="en-del" aria-label="Delete entry" onClick={() => delExpense(e.id)}><Trash2 size={14} /></button>
+                </li>
+              );
+            })}
           </ul>
         )}
       </section>
+
+      </>)}
 
       {importOpen && (
         <ImportWizard categories={categories} sym={sym} merchantMap={merchantMap} existing={expenses}
           onClose={() => setImportOpen(false)} onImport={onImport} />
       )}
 
-      <footer className="foot">Budgets loaded from your FY 2026–27 sheet · everything you log is saved on this device.</footer>
+      <footer className="foot">Manali's Ledger · FY 2026–27 · everything you log is saved on this device.</footer>
 
       {/* drawer */}
       {manageOpen && (
         <div className="scrim" onClick={() => setManageOpen(false)}>
           <div className="drawer" onClick={(e) => e.stopPropagation()}>
             <div className="drawer-head">
-              <h2>Budgets &amp; income</h2>
+              <h2>Budgets</h2>
               <button className="icon-btn" aria-label="Close" onClick={() => setManageOpen(false)}><X size={18} /></button>
             </div>
             <p className="drawer-hint">Editing amounts for <strong>{selIdxLabel}</strong>. Flat budgets update every month; budgets that vary month-to-month update just this one.</p>
@@ -561,17 +729,6 @@ export default function ExpenseLedger() {
             <div className="cur-row">
               <span>Currency</span>
               <div className="cur-pills">{CURRENCIES.map((c) => (<button key={c} className={c === sym ? "cur on" : "cur"} onClick={() => saveSym(c)}>{c.trim()}</button>))}</div>
-            </div>
-
-            <div className="cat-list income-block">
-              <div className="cat-head"><span>Monthly income</span><span>Amount</span><span /></div>
-              {income.map((l) => (
-                <div className="cat-edit" key={l.id}>
-                  <input value={l.name} readOnly />
-                  <div className="amt-input sm"><span>{sym.trim()}</span><input type="number" min="0" value={l.monthly[mIdx(selMonth)] || 0} onChange={(e) => editIncome(l.id, e.target.value)} /></div>
-                  <span />
-                </div>
-              ))}
             </div>
 
             {SECTIONS.map((sec) => {
@@ -597,6 +754,82 @@ export default function ExpenseLedger() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function StatementStatus({ stmts, selMonth, onToggle }) {
+  const uploaded = new Set(stmts[selMonth] || []);
+  const missing = BANKS.filter((b) => !uploaded.has(b.key));
+  const allDone = missing.length === 0;
+  return (
+    <section className={`panel stmt-panel${allDone ? " stmt-done" : ""}`}>
+      <div className="stmt-head">
+        {allDone
+          ? <><Check size={15} strokeWidth={2.4} className="stmt-icon-ok" /><span>All statements uploaded for {monthLabel(selMonth, { month: "long", year: "numeric" })}</span></>
+          : <><TriangleAlert size={15} strokeWidth={2.2} className="stmt-icon-warn" /><span><strong>{missing.length}</strong> statement{missing.length > 1 ? "s" : ""} missing for {monthLabel(selMonth, { month: "long", year: "numeric" })} — mark uploaded once done</span></>
+        }
+      </div>
+      <div className="stmt-list">
+        {BANKS.map((b) => {
+          const done = uploaded.has(b.key);
+          return (
+            <button key={b.key} className={`stmt-item${done ? " done" : ""}`} onClick={() => onToggle(b.key)}>
+              <span className={`stmt-check${done ? " on" : ""}`}>{done ? <Check size={11} strokeWidth={2.5} /> : null}</span>
+              {b.label}
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function AnalysisView({ grouped, sym, selMonth }) {
+  const label = (k) => { const [y, m] = k.split("-").map(Number); return new Date(y, m - 1, 1).toLocaleDateString("en-US", { month: "long", year: "numeric" }); };
+  return (
+    <div className="analysis-wrap">
+      <div className="panel-head" style={{ marginBottom: 10 }}>
+        <h2 style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 18, fontWeight: 700, margin: 0 }}>
+          Analysis · {label(selMonth)}
+        </h2>
+      </div>
+      {grouped.map((g) => {
+        const data = g.rows.map((r) => ({
+          name: r.name.length > 18 ? r.name.slice(0, 17) + "…" : r.name,
+          spent: Math.round(r.spent),
+          budget: Math.round(r.budget),
+        }));
+        const maxVal = Math.max(...data.map((d) => Math.max(d.spent, d.budget)), 1);
+        return (
+          <div className="panel analysis-panel" key={g.section}>
+            <div className="analysis-sec-head">
+              <span className="sec-name">{g.section}</span>
+              <span className="sec-sub num" style={{ fontSize: 12 }}>
+                <span style={{ color: g.spent > g.budget && g.budget > 0 ? "var(--red)" : "inherit" }}>
+                  {sym}{new Intl.NumberFormat("en-IN").format(Math.round(g.spent))}
+                </span>
+                {g.budget > 0 && <span style={{ color: "var(--faint)" }}> / {sym}{new Intl.NumberFormat("en-IN").format(Math.round(g.budget))}</span>}
+              </span>
+            </div>
+            <ResponsiveContainer width="100%" height={data.length * 44 + 20}>
+              <BarChart data={data} layout="vertical" margin={{ top: 4, right: 24, left: 4, bottom: 4 }} barCategoryGap="28%">
+                <XAxis type="number" domain={[0, maxVal]} hide />
+                <YAxis type="category" dataKey="name" width={130} tick={{ fontSize: 12, fill: "var(--ink)", fontFamily: "Inter,sans-serif" }} axisLine={false} tickLine={false} />
+                <Tooltip
+                  contentStyle={{ borderRadius: 10, border: "1px solid var(--hairline)", fontSize: 12, fontFamily: "Inter,sans-serif" }}
+                  formatter={(v, n) => [`${sym}${new Intl.NumberFormat("en-IN").format(v)}`, n === "spent" ? "Spent" : "Budget"]} />
+                <Bar dataKey="budget" name="budget" radius={[0, 4, 4, 0]} maxBarSize={10} fill="var(--hairline)" />
+                <Bar dataKey="spent" name="spent" radius={[0, 4, 4, 0]} maxBarSize={10}>
+                  {data.map((d, i) => (
+                    <Cell key={i} fill={d.spent > d.budget && d.budget > 0 ? "var(--red)" : d.spent >= d.budget * 0.8 ? "var(--amber)" : "var(--teal)"} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -746,6 +979,13 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
   const [onlyUnassigned, setOnlyUnassigned] = useState(false);
   const [bulkCat, setBulkCat] = useState("");
   const [err, setErr] = useState("");
+  const [sbiPwd, setSbiPwd] = useState(() => { try { return localStorage.getItem("ledger:sbiPwd") || ""; } catch { return ""; } });
+  const [ccPwd, setCcPwd] = useState(() => { try { return localStorage.getItem("ledger:ccPwd") || ""; } catch { return ""; } });
+  const [bomPwd, setBomPwd] = useState(() => { try { return localStorage.getItem("ledger:bomPwd") || ""; } catch { return ""; } });
+  const [hdfcBankPwd, setHdfcBankPwd] = useState(() => { try { return localStorage.getItem("ledger:hdfcBankPwd") || ""; } catch { return ""; } });
+  const [ccCardType, setCcCardType] = useState("hdfc_regalia");
+  const [sbiOwner, setSbiOwner] = useState("sbi_srp");
+  const [bankSource, setBankSource] = useState(null);
   const [dup, setDup] = useState({});
   const dupKey = (date, amount, desc) => `${date}|${Math.round(amount)}|${normMerchant(desc)}`;
   const existingKeys = useMemo(() => new Set((existing || []).map((e) => dupKey(e.date, e.amount, e.note))), [existing]);
@@ -800,6 +1040,145 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
     }
   };
 
+
+  const handleSBIFile = async (e) => {
+    const f = e.target.files?.[0]; if (!f) return;
+    e.target.value = "";
+    setErr(""); setFileName(f.name);
+    if (!sbiPwd.trim()) { setErr("Enter your SBI statement password first."); return; }
+    try { localStorage.setItem("ledger:sbiPwd", sbiPwd); } catch {}
+    setStep("loading");
+    try {
+      const b64 = await fileToB64(f);
+      const res = await fetch("/api/decrypt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file: b64, password: sbiPwd.trim() }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "Decryption failed");
+      const list = data.transactions.map((t, i) => ({
+        key: "sbi" + i, date: t.date, desc: t.description, amount: t.amount,
+      }));
+      setBankSource(sbiOwner);
+      toReview(list, false);
+    } catch (ex) {
+      console.error(ex);
+      setErr("Could not decrypt: " + (ex.message || "check password and try again."));
+      setStep("upload");
+    }
+  };
+
+  const handleUBIFile = async (e) => {
+    const f = e.target.files?.[0]; if (!f) return;
+    e.target.value = "";
+    setErr(""); setFileName(f.name);
+    setStep("loading");
+    try {
+      const b64 = await fileToB64(f);
+      const res = await fetch("/api/decrypt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file: b64, password: "", bank: "ubi" }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "Parsing failed");
+      const list = data.transactions.map((t, i) => ({
+        key: "ubi" + i, date: t.date, desc: t.description, amount: t.amount,
+      }));
+      setBankSource("ubi");
+      toReview(list, false);
+    } catch (ex) {
+      console.error(ex);
+      setErr("Could not parse UBI statement: " + (ex.message || "try again."));
+      setStep("upload");
+    }
+  };
+
+  const handleBOMFile = async (e) => {
+    const f = e.target.files?.[0]; if (!f) return;
+    e.target.value = "";
+    setErr(""); setFileName(f.name);
+    if (!bomPwd.trim()) { setErr("Enter your Bank of Maharashtra statement password first."); return; }
+    try { localStorage.setItem("ledger:bomPwd", bomPwd); } catch {}
+    setStep("loading");
+    try {
+      const b64 = await fileToB64(f);
+      const res = await fetch("/api/decrypt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file: b64, password: bomPwd.trim(), bank: "bom" }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "Decryption failed");
+      const list = data.transactions.map((t, i) => ({
+        key: "bom" + i, date: t.date, desc: t.description, amount: t.amount,
+      }));
+      setBankSource("bom");
+      toReview(list, false);
+    } catch (ex) {
+      console.error(ex);
+      setErr("Could not decrypt: " + (ex.message || "check password and try again."));
+      setStep("upload");
+    }
+  };
+
+  const handleHDFCBankFile = async (e) => {
+    const f = e.target.files?.[0]; if (!f) return;
+    e.target.value = "";
+    setErr(""); setFileName(f.name);
+    if (!hdfcBankPwd.trim()) { setErr("Enter your HDFC Bank statement password first."); return; }
+    try { localStorage.setItem("ledger:hdfcBankPwd", hdfcBankPwd); } catch {}
+    setStep("loading");
+    try {
+      const b64 = await fileToB64(f);
+      const res = await fetch("/api/decrypt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file: b64, password: hdfcBankPwd.trim(), bank: "hdfc_bank" }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "Decryption failed");
+      const list = data.transactions.map((t, i) => ({
+        key: "hdfcbank" + i, date: t.date, desc: t.description, amount: t.amount,
+      }));
+      setBankSource("hdfc_bank");
+      toReview(list, false);
+    } catch (ex) {
+      console.error(ex);
+      setErr("Could not decrypt: " + (ex.message || "check password and try again."));
+      setStep("upload");
+    }
+  };
+
+  const handleCCFile = async (e) => {
+    const f = e.target.files?.[0]; if (!f) return;
+    e.target.value = "";
+    setErr(""); setFileName(f.name);
+    if (!ccPwd.trim()) { setErr("Enter your credit card statement password first."); return; }
+    try { localStorage.setItem("ledger:ccPwd", ccPwd); } catch {}
+    setStep("loading");
+    try {
+      const b64 = await fileToB64(f);
+      const res = await fetch("/api/decrypt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file: b64, password: ccPwd.trim(), bank: "hdfc_cc" }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "Decryption failed");
+      const list = data.transactions.map((t, i) => ({
+        key: "cc" + i, date: t.date, desc: t.description, amount: t.amount,
+      }));
+      setBankSource(ccCardType);
+      toReview(list, false);
+    } catch (ex) {
+      console.error(ex);
+      setErr("Could not decrypt: " + (ex.message || "check password and try again."));
+      setStep("upload");
+    }
+  };
+
   const headerCells = rows[headerRow] || [];
   const colOpts = headerCells.map((h, i) => ({ i, label: colLabel(i, h) }));
 
@@ -848,7 +1227,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
       newMap = { ...merchantMap };
       picked.forEach((t) => { const mk = normMerchant(t.desc); if (mk) newMap[mk] = assign[t.key]; });
     }
-    onImport(expenses, newMap);
+    onImport(expenses, newMap, bankSource);
   };
 
   return (
@@ -877,6 +1256,98 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
             </label>
             <div className="imp-note">
               <Info size={14} /> Nothing is categorised on its own — you choose every category in the next step. Anything that looks already imported is detected and left unticked. For long PDF statements, a CSV/Excel export is more reliable.
+            </div>
+            <div className="imp-divider">or</div>
+            <div className="sbi-block">
+              <div className="sbi-title"><FileSpreadsheet size={15} /> SBI Password-Protected Statement</div>
+              <div className="sbi-row" style={{ flexWrap: "wrap", gap: 8 }}>
+                <select className="sbi-pwd" style={{ flex: "0 0 auto", width: "auto" }} value={sbiOwner} onChange={(e) => setSbiOwner(e.target.value)}>
+                  <option value="sbi_srp">SBI SRP</option>
+                  <option value="sbi_sid">SBI Sid</option>
+                </select>
+                <input
+                  type="password"
+                  className="sbi-pwd"
+                  placeholder="Statement password"
+                  value={sbiPwd}
+                  onChange={(e) => setSbiPwd(e.target.value)}
+                />
+                <label className="sbi-upload-btn" style={!sbiPwd.trim() ? {opacity:.45,pointerEvents:"none"} : {}}>
+                  Upload .xlsx
+                  <input type="file" accept=".xlsx" onChange={handleSBIFile} hidden />
+                </label>
+              </div>
+              <div className="imp-note"><Info size={14} /> Select whose account, then enter password. Each import marks that SBI account as done for the month.</div>
+            </div>
+            <div className="imp-divider">or</div>
+            <div className="sbi-block">
+              <div className="sbi-title"><FileSpreadsheet size={15} /> HDFC Credit Card Statement (PDF)</div>
+              <div className="sbi-row" style={{ flexWrap: "wrap", gap: 8 }}>
+                <select className="sbi-pwd" style={{ flex: "0 0 auto", width: "auto" }} value={ccCardType} onChange={(e) => setCcCardType(e.target.value)}>
+                  <option value="hdfc_regalia">Regalia (SIDD0971)</option>
+                  <option value="hdfc_solitaire">Solitaire (SARY5172)</option>
+                </select>
+                <input
+                  type="password"
+                  className="sbi-pwd"
+                  placeholder="Statement password"
+                  value={ccPwd}
+                  onChange={(e) => setCcPwd(e.target.value)}
+                />
+                <label className="sbi-upload-btn" style={!ccPwd.trim() ? {opacity:.45,pointerEvents:"none"} : {}}>
+                  Upload .pdf
+                  <input type="file" accept=".pdf" onChange={handleCCFile} hidden />
+                </label>
+              </div>
+              <div className="imp-note"><Info size={14} /> Select which card, then enter its password. Import once per card — each upload marks that card as done for the month.</div>
+            </div>
+            <div className="imp-divider">or</div>
+            <div className="sbi-block">
+              <div className="sbi-title"><FileSpreadsheet size={15} /> Bank of Maharashtra Statement (PDF)</div>
+              <div className="sbi-row">
+                <input
+                  type="password"
+                  className="sbi-pwd"
+                  placeholder="Statement password"
+                  value={bomPwd}
+                  onChange={(e) => setBomPwd(e.target.value)}
+                />
+                <label className="sbi-upload-btn" style={!bomPwd.trim() ? {opacity:.45,pointerEvents:"none"} : {}}>
+                  Upload .pdf
+                  <input type="file" accept=".pdf,.PDF" onChange={handleBOMFile} hidden />
+                </label>
+              </div>
+              <div className="imp-note"><Info size={14} /> Password is saved in your browser. Only debits are imported — credits and internal transfers are excluded.</div>
+            </div>
+            <div className="imp-divider">or</div>
+            <div className="sbi-block">
+              <div className="sbi-title"><FileSpreadsheet size={15} /> Union Bank of India Statement (Excel)</div>
+              <div className="sbi-row">
+                <span style={{flex:1, fontSize:12, color:"var(--faint)"}}>No password needed — download the .xlsx from UBI NetBanking and upload directly.</span>
+                <label className="sbi-upload-btn">
+                  Upload .xlsx
+                  <input type="file" accept=".xlsx,.xls" onChange={handleUBIFile} hidden />
+                </label>
+              </div>
+              <div className="imp-note"><Info size={14} /> Only withdrawals are imported. UBI statements include your own category labels — these appear as descriptions.</div>
+            </div>
+            <div className="imp-divider">or</div>
+            <div className="sbi-block">
+              <div className="sbi-title"><FileSpreadsheet size={15} /> HDFC Bank Account Statement (PDF)</div>
+              <div className="sbi-row">
+                <input
+                  type="password"
+                  className="sbi-pwd"
+                  placeholder="Statement password"
+                  value={hdfcBankPwd}
+                  onChange={(e) => setHdfcBankPwd(e.target.value)}
+                />
+                <label className="sbi-upload-btn" style={!hdfcBankPwd.trim() ? {opacity:.45,pointerEvents:"none"} : {}}>
+                  Upload .pdf
+                  <input type="file" accept=".pdf" onChange={handleHDFCBankFile} hidden />
+                </label>
+              </div>
+              <div className="imp-note"><Info size={14} /> Password is saved in your browser. Only debits are imported — salary credits and refunds are excluded. CC bill payments appear here AND in CC statements; skip the duplicates in the review step.</div>
             </div>
           </div>
         )}
@@ -948,16 +1419,28 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
           </div>
         )}
 
-        {step === "review" && (
+        {step === "review" && (() => {
+          const includedCount = txns.filter((t) => include[t.key]).length;
+          const uncatCount = txns.filter((t) => include[t.key] && !assign[t.key]).length;
+          const canImport = assignedCount > 0 && uncatCount === 0;
+          return (
           <div className="imp-body">
             <div className="rev-summary">
-              <strong>{txns.length}</strong> found · <strong>{assignedCount}</strong> categorised · <strong>{money(importTotal, sym)}</strong> to import
+              <strong>{txns.length}</strong> found · <strong>{includedCount}</strong> selected
+              {uncatCount > 0
+                ? <span className="rev-uncat"> · <strong>{uncatCount}</strong> still need a category ↓</span>
+                : assignedCount > 0 ? <span style={{color:"var(--teal)"}}> · all categorised ✓</span> : null}
               {dupCount > 0 && <span className="rev-dupnote"> · {dupCount} look already imported (unticked)</span>}
             </div>
+            {uncatCount > 0 && (
+              <div className="imp-readnote" style={{background:"#FFFBF4",borderColor:"#F0DBB8",color:"var(--amber)"}}>
+                <Info size={14} /> Pick a category for every ticked transaction before saving — uncategorised ones won't be imported.
+              </div>
+            )}
             {viaAPI && <div className="imp-readnote"><Info size={14} /> Read from your statement by Claude — please sanity-check amounts and dates before importing.</div>}
             <div className="rev-tools">
               <div className="rev-search"><Search size={14} /><input placeholder="Filter by description…" value={search} onChange={(e) => setSearch(e.target.value)} /></div>
-              <label className="chk-inline"><input type="checkbox" checked={onlyUnassigned} onChange={(e) => setOnlyUnassigned(e.target.checked)} /> Unassigned only</label>
+              <label className="chk-inline"><input type="checkbox" checked={onlyUnassigned} onChange={(e) => setOnlyUnassigned(e.target.checked)} /> Uncategorised only</label>
             </div>
             <div className="bulk">
               <span>Set all shown to:</span>
@@ -965,27 +1448,33 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
               <button className="btn-ghost sm" disabled={!bulkCat} onClick={applyBulk}>Apply to {visible.length}</button>
             </div>
             <div className="rev-list">
-              {visible.map((t) => (
-                <div className={`rev-row ${!include[t.key] ? "off" : ""}`} key={t.key}>
-                  <input type="checkbox" checked={!!include[t.key]} onChange={(e) => setInclude({ ...include, [t.key]: e.target.checked })} />
-                  <div className="rev-main">
-                    <span className="rev-desc">{t.desc || "—"}{dup[t.key] && <span className="dupbadge">already imported?</span>}</span>
-                    <span className="rev-meta num">{t.date || "no date"} · {money(t.amount, sym)}</span>
+              {visible.map((t) => {
+                const needsCat = include[t.key] && !assign[t.key];
+                return (
+                  <div className={`rev-row ${!include[t.key] ? "off" : ""} ${needsCat ? "needs-cat" : ""}`} key={t.key}>
+                    <input type="checkbox" checked={!!include[t.key]} onChange={(e) => setInclude({ ...include, [t.key]: e.target.checked })} />
+                    <div className="rev-main">
+                      <span className="rev-desc">{t.desc || "—"}{dup[t.key] && <span className="dupbadge">already imported?</span>}</span>
+                      <span className="rev-meta num">{t.date || "no date"} · {money(t.amount, sym)}</span>
+                    </div>
+                    <CatSelect categories={categories} value={assign[t.key] || ""}
+                      onChange={(v) => setAssign({ ...assign, [t.key]: v })}
+                      hint={assign[t.key] && merchantMap[normMerchant(t.desc)] === assign[t.key] ? "remembered from last time" : needsCat ? "← pick a category" : ""} />
                   </div>
-                  <CatSelect categories={categories} value={assign[t.key] || ""}
-                    onChange={(v) => setAssign({ ...assign, [t.key]: v })}
-                    hint={assign[t.key] && merchantMap[normMerchant(t.desc)] === assign[t.key] ? "from your earlier tagging" : ""} />
-                </div>
-              ))}
+                );
+              })}
               {!visible.length && <div className="empty">No transactions match this filter.</div>}
             </div>
-            <label className="remember"><input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} /> Remember these merchant → category choices and pre-fill them next time (off by default — you always pick first)</label>
+            <label className="remember"><input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} /> Remember these merchant → category choices and pre-fill them next time</label>
             <div className="imp-actions">
               <button className="btn-ghost" onClick={() => setStep("map")}>Back</button>
-              <button className="btn-add" disabled={!assignedCount} onClick={doImport}><Check size={16} /> Import {assignedCount} expense{assignedCount === 1 ? "" : "s"}</button>
+              <button className="btn-add" disabled={!canImport} onClick={doImport}>
+                <Check size={16} /> {canImport ? `Save ${assignedCount} expense${assignedCount === 1 ? "" : "s"}` : uncatCount > 0 ? `${uncatCount} still need a category` : "Select transactions above"}
+              </button>
             </div>
           </div>
-        )}
+          );
+        })()}
       </div>
     </div>
   );
@@ -1047,7 +1536,7 @@ function Styles() {
 .sec{margin-bottom:18px;}
 .sec:last-child{margin-bottom:0;}
 .sec-head{display:flex; justify-content:space-between; align-items:baseline; padding-bottom:8px; margin-bottom:12px; border-bottom:1px solid var(--hairline);}
-.sec-name{font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.06em; color:var(--muted);}
+.sec-name{font-size:13px; font-weight:600; text-transform:uppercase; letter-spacing:.06em; color:var(--muted);}
 .sec-sub{font-size:12px; font-weight:600;}
 .rows{display:flex; flex-direction:column; gap:14px;}
 .row-top{display:flex; justify-content:space-between; align-items:baseline; margin-bottom:7px;}
@@ -1085,7 +1574,7 @@ function Styles() {
 .overlist li:last-child{border-bottom:0;}
 .overlist .fig-over{display:inline-flex; align-items:center; gap:2px; font-weight:600; font-size:12.5px;}
 
-.logbar{margin-top:14px;}
+.logbar{margin-bottom:14px;}
 .logform{display:grid; grid-template-columns:1.1fr .9fr .9fr 1.4fr auto; gap:9px;}
 .logform select,.logform input[type=date],.logform input[type=text]{background:var(--surface); border:1px solid var(--hairline); border-radius:10px; padding:10px 12px; font-size:13px; font-family:inherit; color:var(--ink); width:100%;}
 .amt-input{display:flex; align-items:center; background:var(--surface); border:1px solid var(--hairline); border-radius:10px; padding:0 12px;}
@@ -1097,9 +1586,36 @@ function Styles() {
 .btn-add:hover{background:#000;}
 .btn-add.full{width:100%; margin-top:12px; padding:12px;}
 .btn-sample{display:inline-flex; align-items:center; gap:6px; background:var(--teal-soft); color:var(--teal); border:0; border-radius:9px; padding:7px 12px; font-size:12.5px; font-weight:600; cursor:pointer; font-family:inherit;}
+.btn-ghost-active{background:var(--ink); color:#fff; border-color:var(--ink);}
+.btn-ghost-active:hover{background:#000; border-color:#000;}
+.btn-add.flash{background:var(--teal);}
+.person-row{grid-column:1 / -1; display:flex; align-items:center; gap:7px; padding:2px 0;}
+.person-label{font-size:12px; color:var(--muted); font-weight:500; flex-shrink:0;}
+.person-btn{border:1px solid var(--hairline); background:var(--bg); border-radius:20px; padding:4px 13px; font-size:12px; font-weight:500; cursor:pointer; font-family:inherit; color:var(--muted); transition:all .12s;}
+.person-btn:hover{border-color:var(--ink); color:var(--ink);}
+.person-btn.on{background:var(--ink); color:#fff; border-color:var(--ink);}
+.split-hint{font-size:11.5px; color:var(--teal); font-weight:500; margin-left:4px;}
+.person-tag{display:inline-block; background:var(--teal-soft); color:var(--teal); font-size:10px; font-weight:600; padding:1px 6px; border-radius:5px; margin-left:5px; font-family:'JetBrains Mono',monospace;}
+.analysis-wrap{display:flex; flex-direction:column; gap:14px;}
+.analysis-panel{padding:14px 18px 6px;}
+.analysis-sec-head{display:flex; justify-content:space-between; align-items:baseline; padding-bottom:8px; margin-bottom:4px; border-bottom:1px solid var(--hairline);}
+
+/* statement status */
+.stmt-panel{margin-bottom:14px; padding:12px 16px;}
+.stmt-done{border-color:var(--teal);}
+.stmt-head{display:flex; align-items:center; gap:8px; font-size:13px; margin-bottom:10px;}
+.stmt-head strong{font-weight:600;}
+.stmt-icon-warn{color:var(--amber); flex-shrink:0;}
+.stmt-icon-ok{color:var(--teal); flex-shrink:0;}
+.stmt-list{display:flex; flex-wrap:wrap; gap:7px;}
+.stmt-item{display:inline-flex; align-items:center; gap:6px; border:1px solid var(--hairline); background:var(--bg); border-radius:20px; padding:5px 12px; font-size:12px; font-weight:500; cursor:pointer; font-family:inherit; color:var(--muted); transition:all .12s;}
+.stmt-item:hover{border-color:var(--ink); color:var(--ink);}
+.stmt-item.done{background:var(--teal-soft); color:var(--teal); border-color:var(--teal);}
+.stmt-check{width:14px; height:14px; border:1.5px solid var(--hairline); border-radius:3px; display:grid; place-items:center; flex-shrink:0;}
+.stmt-item.done .stmt-check{background:var(--teal); border-color:var(--teal); color:#fff;}
 
 .entries{list-style:none; margin:0; padding:0; display:flex; flex-direction:column;}
-.entries li{display:grid; grid-template-columns:88px 1.3fr 1.6fr auto 30px; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid var(--hairline); font-size:13px;}
+.entries li{display:grid; grid-template-columns:88px 1.3fr 1.6fr auto 30px 30px; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid var(--hairline); font-size:13px;}
 .entries li:last-child{border-bottom:0;}
 .en-date{font-size:12px; color:var(--muted);}
 .en-cat{font-weight:500;}
@@ -1107,6 +1623,12 @@ function Styles() {
 .en-amt{text-align:right; font-weight:600;}
 .en-del{border:0; background:transparent; color:var(--faint); cursor:pointer; display:grid; place-items:center; padding:5px; border-radius:7px;}
 .en-del:hover{color:var(--red); background:var(--red-soft);}
+.entries li.en-edit{display:grid; grid-template-columns:1.4fr .75fr .85fr 1fr auto; gap:8px; padding:10px 0; background:var(--bg); border-radius:10px; padding:10px 12px; margin:2px -12px;}
+.en-edit-cat{border:1px solid var(--hairline); border-radius:9px; padding:8px 10px; font-size:12.5px; font-family:inherit; background:var(--surface); color:var(--ink);}
+.en-edit-amt{background:var(--surface);}
+.en-edit-date{border:1px solid var(--hairline); border-radius:9px; padding:8px 10px; font-size:12.5px; font-family:inherit; background:var(--surface); color:var(--ink);}
+.en-edit-note{border:1px solid var(--hairline); border-radius:9px; padding:8px 10px; font-size:12.5px; font-family:inherit; background:var(--surface); color:var(--ink);}
+.en-edit-btns{display:flex; gap:5px; justify-content:flex-end;}
 
 .empty{padding:24px 4px; text-align:center; color:var(--muted); font-size:13.5px;}
 .foot{text-align:center; color:var(--faint); font-size:11.5px; margin-top:18px;}
@@ -1164,6 +1686,14 @@ function Styles() {
 .radio,.chk-inline{display:inline-flex; align-items:center; gap:7px; font-size:12.5px; color:var(--ink); cursor:pointer;}
 .imp-actions{display:flex; justify-content:space-between; gap:10px; padding-top:6px;}
 .imp-actions .btn-add[disabled]{opacity:.45; cursor:not-allowed;}
+.imp-divider{display:flex; align-items:center; gap:10px; color:var(--faint); font-size:11px; font-weight:500; text-transform:uppercase; letter-spacing:.06em;}
+.imp-divider::before,.imp-divider::after{content:""; flex:1; height:1px; background:var(--hairline);}
+.sbi-block{border:1.5px dashed var(--hairline); border-radius:14px; padding:16px 18px; background:var(--surface); display:flex; flex-direction:column; gap:10px;}
+.sbi-title{font-size:13px; font-weight:600; display:flex; align-items:center; gap:7px; color:var(--ink);}
+.sbi-row{display:flex; gap:8px; align-items:center;}
+.sbi-pwd{flex:1; border:1px solid var(--hairline); border-radius:9px; padding:9px 11px; font-size:13px; font-family:inherit; background:var(--bg); color:var(--ink); outline:none;}
+.sbi-pwd:focus{border-color:var(--teal);}
+.sbi-upload-btn{display:inline-flex; align-items:center; gap:6px; background:var(--ink); color:#fff; border-radius:9px; padding:9px 14px; font-size:12.5px; font-weight:600; cursor:pointer; white-space:nowrap; transition:opacity .15s;}
 .rev-summary{font-size:13px; color:var(--muted);}
 .rev-summary strong{color:var(--ink);}
 .rev-dupnote{color:var(--amber);}
@@ -1184,6 +1714,8 @@ function Styles() {
 .catsel select{border:1px solid var(--hairline); border-radius:9px; padding:8px 9px; font-size:12.5px; font-family:inherit; background:var(--surface); color:var(--ink); width:100%;}
 .catsel select.needpick{border-color:var(--amber); background:#FFFBF4;}
 .catsel-hint{font-size:10px; color:var(--teal);}
+.rev-row.needs-cat{background:#FFFBF4; border-left:3px solid var(--amber); padding-left:10px;}
+.rev-uncat{color:var(--amber); font-weight:600;}
 .remember{display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); cursor:pointer;}
 
 @media (max-width:820px){
@@ -1192,7 +1724,9 @@ function Styles() {
   .grid{grid-template-columns:1fr;}
   .logform{grid-template-columns:1fr 1fr;}
   .logform .btn-add{grid-column:1 / -1;}
-  .entries li{grid-template-columns:64px 1fr auto 28px;}
+  .entries li{grid-template-columns:64px 1fr auto 28px 28px;}
+  .entries li.en-edit{grid-template-columns:1fr 1fr; row-gap:6px;}
+  .en-edit-btns{grid-column:1/-1; justify-content:flex-start;}
   .en-note{display:none;}
   .map-grid{grid-template-columns:1fr;}
   .rev-row{grid-template-columns:auto 1fr; row-gap:8px;}
@@ -1201,3 +1735,4 @@ function Styles() {
 @media (prefers-reduced-motion:reduce){ .seg,.usebar-fill{transition:none;} }
 `}</style>);
 }
+                                                                               
