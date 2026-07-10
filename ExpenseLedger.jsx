@@ -489,7 +489,7 @@ export default function ExpenseLedger() {
           <input type="date" value={fDate} onChange={(e) => setFDate(e.target.value)} aria-label="Date" />
           <input type="text" placeholder="Note (optional)" value={fNote} onChange={(e) => setFNote(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addExpense()} />
           <button className={`btn-add${addedFlash ? " flash" : ""}`} onClick={addExpense}><Plus size={16} /> {addedFlash ? "Saved!" : "Add"}</button>
-          {catById[fCat] && PERSON_CATS.has(catById[fCat]?.name) && (
+          {catById[fCat] && (
             <div className="person-row">
               <span className="person-label">For:</span>
               {["Sid", "Manali", "Saryu"].map((p) => (
@@ -987,6 +987,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
   const [hdfcBankPwd, setHdfcBankPwd] = useState(() => { try { return localStorage.getItem("ledger:hdfcBankPwd") || ""; } catch { return ""; } });
   const [ccCardType, setCcCardType] = useState("hdfc_regalia");
   const [sbiOwner, setSbiOwner] = useState("sbi_srp");
+  const [genericBank, setGenericBank] = useState("");
   const [bankSource, setBankSource] = useState(null);
   const [dup, setDup] = useState({});
   const [personAssign, setPersonAssign] = useState({});
@@ -1008,7 +1009,9 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
 
   const handleFile = async (e) => {
     const f = e.target.files?.[0]; if (!f) return;
+    if (!genericBank) { e.target.value = ""; setErr("Pick which bank / card this file is from first."); return; }
     setErr(""); setFileName(f.name);
+    setBankSource(genericBank);
     const nm = f.name.toLowerCase();
     const isDoc = nm.endsWith(".pdf") || /\.(png|jpe?g|webp)$/.test(nm);
     try {
@@ -1252,7 +1255,14 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
 
         {step === "upload" && (
           <div className="imp-body">
-            <label className="dropzone">
+            <div className="sbi-row" style={{ flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+              <span className="person-label" style={{ fontWeight: 600 }}>Account for this file:</span>
+              <select className="sbi-pwd" style={{ flex: "0 0 auto", width: "auto" }} value={genericBank} onChange={(e) => setGenericBank(e.target.value)}>
+                <option value="">— select bank / card —</option>
+                {BANKS.map((b) => <option key={b.key} value={b.key}>{b.label}</option>)}
+              </select>
+            </div>
+            <label className="dropzone" style={!genericBank ? { opacity: .45, pointerEvents: "none" } : {}}>
               <FileSpreadsheet size={26} strokeWidth={1.6} />
               <span className="dz-title">Choose a CSV, Excel or PDF file</span>
               <span className="dz-sub">CSV &amp; Excel are read on your device. PDFs (and photos of statements) are read by Claude's API.</span>
@@ -1465,7 +1475,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
                     <CatSelect categories={categories} value={assign[t.key] || ""}
                       onChange={(v) => setAssign({ ...assign, [t.key]: v })}
                       hint={assign[t.key] && merchantMap[normMerchant(t.desc)] === assign[t.key] ? "remembered from last time" : needsCat ? "← pick a category" : ""} />
-                    {assign[t.key] && PERSON_CATS.has(catById[assign[t.key]]?.name) && (
+                    {assign[t.key] && (
                       <div className="person-row">
                         {["Sid","Manali","Saryu"].map(p => {
                           const sel = (personAssign[t.key]||"").split(",").filter(Boolean);
