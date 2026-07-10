@@ -88,6 +88,7 @@ const SEED = [
   ["Caretaker", "Utilities", true, flat(16500)],
   ["Laundry", "Utilities", true, flat(1000)],
   ["Flower", "Utilities", true, flat(250)],
+  ["Bai", "Utilities", true, flat(5500)],
   // Personal
   ["Allowance", "Personal", true, flat(15000)],
   ["Medical", "Personal", true, flat(5000)],
@@ -133,7 +134,7 @@ const store = {
 };
 const K_CATS = "ledger:categories", K_EXP = "ledger:expenses", K_SET = "ledger:settings", K_INC = "ledger:income";
 const K_MAP = "ledger:merchantMap", K_STMTS = "ledger:stmts";
-const CAT_VERSION = 5;
+const CAT_VERSION = 6;
 
 const BANKS = [
   { key: "hdfc_regalia",  label: "HDFC Regalia CC",       auto: false },
@@ -696,6 +697,7 @@ export default function ExpenseLedger() {
                 <li key={e.id}>
                   <span className="en-date num">{e.date.slice(8, 10)} {monthLabel(e.date.slice(0, 7), { month: "short" })}</span>
                   <span className="en-cat">{catById[e.cat]?.name || "Uncategorised"}</span>
+                  <span className="en-bank">{BANKS.find(b => b.key === e.bank)?.label || (e.src === "import" ? e.bank : "—")}</span>
                   <span className="en-note">{e.note || "—"}{e.person && e.person.split(",").map((p) => <span key={p} className="person-tag">{p}</span>)}</span>
                   <span className="en-amt num">{money(e.amount, sym)}</span>
                   <button className="en-del" aria-label="Edit entry" onClick={() => startEdit(e)}><Pencil size={13} /></button>
@@ -987,6 +989,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
   const [sbiOwner, setSbiOwner] = useState("sbi_srp");
   const [bankSource, setBankSource] = useState(null);
   const [dup, setDup] = useState({});
+  const [personAssign, setPersonAssign] = useState({});
   const dupKey = (date, amount, desc) => `${date}|${Math.round(amount)}|${normMerchant(desc)}`;
   const existingKeys = useMemo(() => new Set((existing || []).map((e) => dupKey(e.date, e.amount, e.note))), [existing]);
 
@@ -999,7 +1002,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
       const mk = normMerchant(t.desc);
       if (mk && merchantMap[mk]) asg[t.key] = merchantMap[mk];
     });
-    setTxns(out); setAssign(asg); setInclude(inc); setDup(dp); setViaAPI(!!fromAPI); setErr(""); setStep("review");
+    setTxns(out); setAssign(asg); setInclude(inc); setDup(dp); setPersonAssign({}); setViaAPI(!!fromAPI); setErr(""); setStep("review");
   };
 
   const handleFile = async (e) => {
@@ -1220,7 +1223,8 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
     const expenses = picked.map((t) => ({
       id: uid(), cat: assign[t.key], amount: t.amount,
       date: t.date || new Date().toISOString().slice(0, 10),
-      note: t.desc || "Imported", src: "import",
+      note: t.desc || "Imported", src: "import", bank: bankSource,
+      ...(personAssign[t.key] && { person: personAssign[t.key] }),
     }));
     let newMap = null;
     if (remember) {
@@ -1460,6 +1464,20 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
                     <CatSelect categories={categories} value={assign[t.key] || ""}
                       onChange={(v) => setAssign({ ...assign, [t.key]: v })}
                       hint={assign[t.key] && merchantMap[normMerchant(t.desc)] === assign[t.key] ? "remembered from last time" : needsCat ? "← pick a category" : ""} />
+                    {assign[t.key] && PERSON_CATS.has(catById[assign[t.key]]?.name) && (
+                      <div className="person-row">
+                        {["Sid","Manali","Saryu"].map(p => {
+                          const sel = (personAssign[t.key]||"").split(",").filter(Boolean);
+                          const on = sel.includes(p);
+                          return <button key={p} type="button"
+                            className={on ? "person-btn on" : "person-btn"}
+                            onClick={() => {
+                              const next = on ? sel.filter(x => x !== p) : [...sel, p];
+                              setPersonAssign({ ...personAssign, [t.key]: next.join(",") });
+                            }}>{p}</button>;
+                        })}
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -1615,7 +1633,7 @@ function Styles() {
 .stmt-item.done .stmt-check{background:var(--teal); border-color:var(--teal); color:#fff;}
 
 .entries{list-style:none; margin:0; padding:0; display:flex; flex-direction:column;}
-.entries li{display:grid; grid-template-columns:88px 1.3fr 1.6fr auto 30px 30px; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid var(--hairline); font-size:13px;}
+.entries li{display:grid; grid-template-columns:88px 1.1fr 90px 1.4fr auto 30px 30px; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid var(--hairline); font-size:13px;}
 .entries li:last-child{border-bottom:0;}
 .en-date{font-size:12px; color:var(--muted);}
 .en-cat{font-weight:500;}
@@ -1733,6 +1751,10 @@ function Styles() {
   .rev-row .catsel{grid-column:1 / -1; padding-left:26px;}
 }
 @media (prefers-reduced-motion:reduce){ .seg,.usebar-fill{transition:none;} }
-`}</style>);
+`}
+.en-bank{font-size:11px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.person-row{display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:4px;}
+.person-btn{border:1px solid var(--border);border-radius:12px;padding:2px 8px;font-size:11px;cursor:pointer;background:transparent;color:var(--ink);line-height:1.6;}
+.person-btn.on{background:var(--teal);color:#fff;border-color:var(--teal);}
+</style>);
 }
-                                                                               
