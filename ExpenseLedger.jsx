@@ -240,6 +240,7 @@ export default function ExpenseLedger() {
   const [fDate, setFDate] = useState(todayISO());
   const [fNote, setFNote] = useState("");
   const [fPerson, setFPerson] = useState([]);
+  const [fBank, setFBank] = useState(() => { try { return localStorage.getItem("ledger:lastBank") || ""; } catch { return ""; } });
   const [catPersonMap, setCatPersonMap] = useState(() => { try { return JSON.parse(localStorage.getItem("ledger:catPersonMap") || "{}"); } catch { return {}; } });
   const [addedFlash, setAddedFlash] = useState(false);
   const [reportFlash, setReportFlash] = useState(false);
@@ -378,6 +379,7 @@ export default function ExpenseLedger() {
     const personStr = fPerson.join(",");
     const entry = { id: uid(), cat: fCat, amount: amt, date: fDate, note: fNote.trim() };
     if (personStr) entry.person = personStr;
+    if (fBank) { entry.bank = fBank; try { localStorage.setItem("ledger:lastBank", fBank); } catch {} }
     saveExps([entry, ...expenses]);
     if (fPerson.length > 0) {
       const next = { ...catPersonMap, [fCat]: fPerson };
@@ -392,14 +394,14 @@ export default function ExpenseLedger() {
 
   const startEdit = (e) => {
     setEditingId(e.id);
-    setEditForm({ cat: e.cat, amount: String(e.amount), date: e.date, note: e.note || "", person: e.person || "" });
+    setEditForm({ cat: e.cat, amount: String(e.amount), date: e.date, note: e.note || "", person: e.person || "", bank: e.bank || "" });
   };
   const cancelEdit = () => setEditingId(null);
   const saveEdit = () => {
     const amt = parseFloat(editForm.amount);
     if (!editForm.cat || !amt || amt <= 0 || !editForm.date) return;
     saveExps(expenses.map((e) => e.id === editingId
-      ? { ...e, cat: editForm.cat, amount: amt, date: editForm.date, note: editForm.note.trim(), ...(editForm.person ? { person: editForm.person } : { person: undefined }) }
+      ? { ...e, cat: editForm.cat, amount: amt, date: editForm.date, note: editForm.note.trim(), ...(editForm.person ? { person: editForm.person } : { person: undefined }), ...(editForm.bank ? { bank: editForm.bank } : { bank: undefined }) }
       : e
     ));
     setEditingId(null);
@@ -550,6 +552,10 @@ export default function ExpenseLedger() {
             <input type="number" min="0" placeholder="Amount" value={fAmt} onChange={(e) => setFAmt(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addExpense()} />
           </div>
           <input type="date" value={fDate} onChange={(e) => setFDate(e.target.value)} aria-label="Date" />
+          <select className="bank-select" value={fBank} onChange={(e) => setFBank(e.target.value)} aria-label="Account / card used">
+            <option value="">&mdash; account &mdash;</option>
+            {BANKS.map((b) => <option key={b.key} value={b.key}>{b.label}</option>)}
+          </select>
           <input type="text" placeholder="Note (optional)" value={fNote} onChange={(e) => setFNote(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addExpense()} />
           <button className={`btn-add${addedFlash ? " flash" : ""}`} onClick={addExpense}><Plus size={16} /> {addedFlash ? "Saved!" : "Add"}</button>
           {catById[fCat] && (
@@ -605,7 +611,7 @@ export default function ExpenseLedger() {
       )}
 
       {view === "analysis" ? (
-        <AnalysisView grouped={grouped} sym={sym} selMonth={selMonth} />
+        <AnalysisView grouped={grouped} sym={sym} selMonth={selMonth} expenses={expenses} categories={categories} catById={catById} />
       ) : (<>
       <div className="grid">
         {/* ledger */}
@@ -748,6 +754,10 @@ export default function ExpenseLedger() {
                       <input type="number" min="0" value={editForm.amount} onChange={(ev) => setEditForm({ ...editForm, amount: ev.target.value })} />
                     </div>
                     <input className="en-edit-date" type="date" value={editForm.date} onChange={(ev) => setEditForm({ ...editForm, date: ev.target.value })} />
+                    <select className="en-edit-bank" value={editForm.bank || ""} onChange={(ev) => setEditForm({ ...editForm, bank: ev.target.value })} aria-label="Account">
+                      <option value="">&mdash; account &mdash;</option>
+                      {BANKS.map((b) => <option key={b.key} value={b.key}>{b.label}</option>)}
+                    </select>
                     <input className="en-edit-note" type="text" placeholder="Note" value={editForm.note} onChange={(ev) => setEditForm({ ...editForm, note: ev.target.value })} onKeyDown={(ev) => ev.key === "Enter" && saveEdit()} />
                     <div className="en-edit-btns">
                       <button className="icon-btn" aria-label="Save" onClick={saveEdit}><Check size={14} strokeWidth={2.5} style={{ color: "var(--teal)" }} /></button>
@@ -850,14 +860,134 @@ function StatementStatus({ stmts, selMonth, onToggle }) {
   );
 }
 
-function AnalysisView({ grouped, sym, selMonth }) {
+function AnalysisView({ grouped, sym, selMonth, expenses = [], categories = [], catById = {} }) {
   const label = (k) => { const [y, m] = k.split("-").map(Number); return new Date(y, m - 1, 1).toLocaleDateString("en-US", { month: "long", year: "numeric" }); };
+  const fmtIN = (n) => `${sym}${new Intl.NumberFormat("en-IN").format(Math.round(n || 0))}`;
+  const bankLabel = (k) => BANKS.find((b) => b.key === k)?.label || (k || "Unassigned");
+
+  const monthExp = useMemo(
+    () => expenses.filter((e) => e.date.slice(0, 7) === selMonth),
+    [expenses, selMonth]
+  );
+
+  /* account-wise (this month) */
+  const acctData = useMemo(() => {
+    const m = {};
+    monthExp.forEach((e) => { const k = e.bank || "__none__"; m[k] = (m[k] || 0) + e.amount; });
+    return Object.entries(m)
+      .map(([k, v]) => ({ name: k === "__none__" ? "Unassigned" : bankLabel(k), spent: Math.round(v) }))
+      .sort((a, b) => b.spent - a.spent);
+  }, [monthExp]);
+  const acctTotal = acctData.reduce((s, d) => s + d.spent, 0);
+
+  /* person-wise (this month); shared entries split equally */
+  const personData = useMemo(() => {
+    const m = {};
+    monthExp.forEach((e) => {
+      const ppl = (e.person || "").split(",").map((x) => x.trim()).filter(Boolean);
+      if (!ppl.length) { m.Untagged = (m.Untagged || 0) + e.amount; }
+      else { const share = e.amount / ppl.length; ppl.forEach((p) => { m[p] = (m[p] || 0) + share; }); }
+    });
+    return Object.entries(m)
+      .map(([k, v]) => ({ name: k, spent: Math.round(v) }))
+      .sort((a, b) => b.spent - a.spent);
+  }, [monthExp]);
+  const personTotal = personData.reduce((s, d) => s + d.spent, 0);
+
+  /* month-over-month across the fiscal year */
+  const momData = useMemo(() => {
+    const keys = [];
+    for (let k = FY_START; k <= FY_END; k = shiftMonth(k, 1)) keys.push(k);
+    return keys.map((k) => ({
+      key: k,
+      name: monthLabel(k, { month: "short" }),
+      spent: Math.round(expenses.filter((e) => e.date.slice(0, 7) === k).reduce((s, e) => s + e.amount, 0)),
+      budget: Math.round(categories.reduce((s, c) => s + budgetFor(c, k), 0)),
+    }));
+  }, [expenses, categories]);
+  const PERSON_COLORS = { Sid: "var(--teal)", Manali: "#c084fc", Saryu: "var(--amber)", Untagged: "var(--hairline)" };
+
   return (
     <div className="analysis-wrap">
       <div className="panel-head" style={{ marginBottom: 10 }}>
         <h2 style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 18, fontWeight: 700, margin: 0 }}>
           Analysis · {label(selMonth)}
         </h2>
+      </div>
+
+      {/* Month-over-month trend (whole FY) */}
+      <div className="panel analysis-panel">
+        <div className="analysis-sec-head">
+          <span className="sec-name">Month over month · FY 2026&ndash;27</span>
+          <span className="sec-sub num" style={{ fontSize: 12, color: "var(--faint)" }}>spent vs budget</span>
+        </div>
+        <ResponsiveContainer width="100%" height={230}>
+          <ComposedChart data={momData} margin={{ top: 8, right: 16, left: 4, bottom: 4 }}>
+            <XAxis dataKey="name" tick={{ fontSize: 11, fill: "var(--muted)", fontFamily: "Inter,sans-serif" }} axisLine={false} tickLine={false} />
+            <YAxis tick={{ fontSize: 11, fill: "var(--faint)", fontFamily: "Inter,sans-serif" }} axisLine={false} tickLine={false} width={44}
+              tickFormatter={(v) => v >= 1000 ? `${Math.round(v / 1000)}k` : v} />
+            <Tooltip contentStyle={{ borderRadius: 10, border: "1px solid var(--hairline)", fontSize: 12, fontFamily: "Inter,sans-serif" }}
+              formatter={(v, n) => [fmtIN(v), n === "spent" ? "Spent" : "Budget"]} />
+            <Legend wrapperStyle={{ fontSize: 12, fontFamily: "Inter,sans-serif" }} />
+            <Bar dataKey="spent" name="Spent" radius={[4, 4, 0, 0]} maxBarSize={26}>
+              {momData.map((d, i) => (
+                <Cell key={i} fill={d.spent > d.budget && d.budget > 0 ? "var(--red)" : d.key === selMonth ? "var(--ink)" : "var(--teal)"} />
+              ))}
+            </Bar>
+            <Line dataKey="budget" name="Budget" type="monotone" stroke="var(--muted)" strokeWidth={1.5} strokeDasharray="4 4" dot={false} />
+          </ComposedChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Account-wise breakdown (this month) */}
+      <div className="panel analysis-panel">
+        <div className="analysis-sec-head">
+          <span className="sec-name">By account · {label(selMonth)}</span>
+          <span className="sec-sub num" style={{ fontSize: 12, color: "var(--faint)" }}>{fmtIN(acctTotal)}</span>
+        </div>
+        {acctData.length === 0 ? (
+          <div className="empty" style={{ padding: "14px 0" }}>No spending logged this month.</div>
+        ) : (
+          <ResponsiveContainer width="100%" height={acctData.length * 40 + 20}>
+            <BarChart data={acctData} layout="vertical" margin={{ top: 4, right: 24, left: 4, bottom: 4 }} barCategoryGap="30%">
+              <XAxis type="number" hide />
+              <YAxis type="category" dataKey="name" width={150} tick={{ fontSize: 12, fill: "var(--ink)", fontFamily: "Inter,sans-serif" }} axisLine={false} tickLine={false} />
+              <Tooltip contentStyle={{ borderRadius: 10, border: "1px solid var(--hairline)", fontSize: 12, fontFamily: "Inter,sans-serif" }}
+                formatter={(v) => [fmtIN(v), "Spent"]} />
+              <Bar dataKey="spent" radius={[0, 4, 4, 0]} maxBarSize={12}>
+                {acctData.map((d, i) => (
+                  <Cell key={i} fill={d.name === "Unassigned" ? "var(--hairline)" : "var(--teal)"} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+
+      {/* Person-wise breakdown (this month) */}
+      <div className="panel analysis-panel">
+        <div className="analysis-sec-head">
+          <span className="sec-name">By person · {label(selMonth)}</span>
+          <span className="sec-sub num" style={{ fontSize: 12, color: "var(--faint)" }}>{fmtIN(personTotal)}</span>
+        </div>
+        {personData.length === 0 ? (
+          <div className="empty" style={{ padding: "14px 0" }}>No spending logged this month.</div>
+        ) : (
+          <ResponsiveContainer width="100%" height={personData.length * 44 + 20}>
+            <BarChart data={personData} layout="vertical" margin={{ top: 4, right: 24, left: 4, bottom: 4 }} barCategoryGap="28%">
+              <XAxis type="number" hide />
+              <YAxis type="category" dataKey="name" width={90} tick={{ fontSize: 12, fill: "var(--ink)", fontFamily: "Inter,sans-serif" }} axisLine={false} tickLine={false} />
+              <Tooltip contentStyle={{ borderRadius: 10, border: "1px solid var(--hairline)", fontSize: 12, fontFamily: "Inter,sans-serif" }}
+                formatter={(v) => [fmtIN(v), "Spent"]} />
+              <Bar dataKey="spent" radius={[0, 4, 4, 0]} maxBarSize={14}>
+                {personData.map((d, i) => (
+                  <Cell key={i} fill={PERSON_COLORS[d.name] || "var(--teal)"} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        )}
+        <div className="imp-note" style={{ marginTop: 6 }}><Info size={13} /> Entries tagged to more than one person are split equally.</div>
       </div>
       {grouped.map((g) => {
         const data = g.rows.map((r) => ({
@@ -1667,7 +1797,7 @@ function Styles() {
 .overlist .fig-over{display:inline-flex; align-items:center; gap:2px; font-weight:600; font-size:12.5px;}
 
 .logbar{margin-bottom:14px;}
-.logform{display:grid; grid-template-columns:1.1fr .9fr .9fr 1.4fr auto; gap:9px;}
+.logform{display:grid; grid-template-columns:1.1fr .85fr .85fr .95fr 1.3fr auto; gap:9px;}
 .logform select,.logform input[type=date],.logform input[type=text]{background:var(--surface); border:1px solid var(--hairline); border-radius:10px; padding:10px 12px; font-size:13px; font-family:inherit; color:var(--ink); width:100%;}
 .amt-input{display:flex; align-items:center; background:var(--surface); border:1px solid var(--hairline); border-radius:10px; padding:0 12px;}
 .amt-input span{color:var(--muted); font-size:13px; font-family:'JetBrains Mono',monospace;}
@@ -1715,7 +1845,8 @@ function Styles() {
 .en-amt{text-align:right; font-weight:600;}
 .en-del{border:0; background:transparent; color:var(--faint); cursor:pointer; display:grid; place-items:center; padding:5px; border-radius:7px;}
 .en-del:hover{color:var(--red); background:var(--red-soft);}
-.entries li.en-edit{display:grid; grid-template-columns:1.4fr .75fr .85fr 1fr auto; gap:8px; padding:10px 0; background:var(--bg); border-radius:10px; padding:10px 12px; margin:2px -12px;}
+.entries li.en-edit{display:grid; grid-template-columns:1.3fr .7fr .8fr .9fr 1fr auto; gap:8px; padding:10px 0; background:var(--bg); border-radius:10px; padding:10px 12px; margin:2px -12px;}
+.en-edit-bank{border:1px solid var(--hairline); border-radius:9px; padding:8px 10px; font-size:12.5px; font-family:inherit; background:var(--surface); color:var(--ink);}
 .en-edit-cat{border:1px solid var(--hairline); border-radius:9px; padding:8px 10px; font-size:12.5px; font-family:inherit; background:var(--surface); color:var(--ink);}
 .en-edit-amt{background:var(--surface);}
 .en-edit-date{border:1px solid var(--hairline); border-radius:9px; padding:8px 10px; font-size:12.5px; font-family:inherit; background:var(--surface); color:var(--ink);}
