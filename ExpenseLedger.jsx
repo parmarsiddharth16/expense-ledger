@@ -128,9 +128,71 @@ const buildIncome = () => [
   { id: uid(), name: "Rent Income", monthly: flat(29000) },
 ];
 
+/* -------------------------------------------------------------------------
+ * Cloud-backed store.
+ * Data now lives in a single JSON blob on the server (/api/data, Vercel Blob)
+ * so it persists across devices, browsers, and deployments. localStorage is
+ * kept as an offline cache / fallback: if the network or the blob store is
+ * unavailable, the app still works exactly as it did before (device-local).
+ * Bank-statement passwords (ledger:*Pwd) are deliberately NOT synced — they
+ * stay on the device only.
+ * ---------------------------------------------------------------------- */
+const SENSITIVE = /Pwd$/; // password keys never leave the device
 const store = {
-  async get(k) { try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : null; } catch { return null; } },
-  async set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { console.error(e); } },
+  cache: null,
+  ready: false,
+  _timer: null,
+  async init() {
+    if (this.ready) return;
+    this.cache = {};
+    // seed from localStorage first (works offline / instant)
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key || !key.startsWith("ledger:") || SENSITIVE.test(key)) continue;
+        try { this.cache[key] = JSON.parse(localStorage.getItem(key)); }
+        catch { this.cache[key] = localStorage.getItem(key); }
+      }
+    } catch {}
+    // overlay the cloud copy (source of truth across devices)
+    try {
+      const res = await fetch("/api/data", { cache: "no-store" });
+      if (res.ok) {
+        const json = await res.json();
+        const remote = json && json.data;
+        if (remote && typeof remote === "object" && Object.keys(remote).length) {
+          this.cache = { ...this.cache, ...remote };
+          try { for (const k in remote) localStorage.setItem(k, JSON.stringify(remote[k])); } catch {}
+        }
+      }
+    } catch {}
+    this.ready = true;
+  },
+  async get(k) {
+    if (this.cache && k in this.cache) return this.cache[k];
+    try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : null; } catch { return null; }
+  },
+  async set(k, v) {
+    if (!this.cache) this.cache = {};
+    this.cache[k] = v;
+    try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { console.error(e); }
+    if (!SENSITIVE.test(k)) this._scheduleSync();
+  },
+  _scheduleSync() {
+    if (this._timer) clearTimeout(this._timer);
+    this._timer = setTimeout(() => this._sync(), 800);
+  },
+  async _sync() {
+    const payload = {};
+    for (const k in this.cache) if (!SENSITIVE.test(k)) payload[k] = this.cache[k];
+    try {
+      await fetch("/api/data", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ data: payload }),
+      });
+    } catch { /* stays in localStorage; retries on next change */ }
+  },
 };
 const K_CATS = "ledger:categories", K_EXP = "ledger:expenses", K_SET = "ledger:settings", K_INC = "ledger:income";
 const K_MAP = "ledger:merchantMap", K_STMTS = "ledger:stmts";
@@ -188,6 +250,7 @@ export default function ExpenseLedger() {
   /* ---- load once (with name-based expense remap on reseed) ---- */
   useEffect(() => {
     (async () => {
+      await store.init();
       const ver = await store.get("ledger:catVersion");
       let cats = await store.get(K_CATS);
       let inc = await store.get(K_INC);
