@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
 import {
   ChevronLeft, ChevronRight, Plus, Trash2, SlidersHorizontal, X,
   TriangleAlert, Check, Wallet, ArrowUpRight, Sparkles, Eye, EyeOff,
-  Upload, FileSpreadsheet, ArrowRight, Search, Info, BarChart2, Pencil
+  Upload, FileSpreadsheet, ArrowRight, Search, Info, BarChart2, Pencil, Download
 } from "lucide-react";
 import {
   ComposedChart, BarChart, Bar, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, Legend
@@ -244,6 +244,7 @@ export default function ExpenseLedger() {
   const [catPersonMap, setCatPersonMap] = useState(() => { try { return JSON.parse(localStorage.getItem("ledger:catPersonMap") || "{}"); } catch { return {}; } });
   const [addedFlash, setAddedFlash] = useState(false);
   const [reportFlash, setReportFlash] = useState(false);
+  const [backupFlash, setBackupFlash] = useState(false);
   const [view, setView] = useState("dashboard");
   const [editingId, setEditingId] = useState(null);
   const [editForm, setEditForm] = useState({});
@@ -407,6 +408,30 @@ export default function ExpenseLedger() {
     setEditingId(null);
   };
 
+  const backupData = () => {
+    try {
+      const data = {
+        _meta: { app: "Manali's Ledger", exportedAt: new Date().toISOString(), version: CAT_VERSION },
+        "ledger:categories": categories,
+        "ledger:income": income,
+        "ledger:expenses": expenses,
+        "ledger:settings": { sym },
+        "ledger:merchantMap": merchantMap,
+        "ledger:stmts": stmts,
+        "ledger:catPersonMap": catPersonMap,
+        "ledger:catVersion": CAT_VERSION,
+      };
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "manali-ledger-backup-" + new Date().toISOString().slice(0, 10) + ".json";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      setBackupFlash(true); setTimeout(() => setBackupFlash(false), 1600);
+    } catch (e) { console.error(e); }
+  };
+
   const generateReport = () => {
     const fmt = (n) => sym + inr.format(Math.round(Math.abs(n || 0)));
     const mo = monthLabel(selMonth, { month: "long", year: "numeric" });
@@ -527,6 +552,7 @@ export default function ExpenseLedger() {
           <button className="btn-ghost" onClick={() => setImportOpen(true)}><Upload size={15} /> Import</button>
           <button className="btn-ghost" onClick={() => setManageOpen(true)}><SlidersHorizontal size={15} /> Budgets</button>
           <button className={`btn-ghost${view === "analysis" ? " btn-ghost-active" : ""}`} onClick={() => setView(v => v === "analysis" ? "dashboard" : "analysis")}><BarChart2 size={15} /> Analysis</button>
+          <button className={`btn-ghost${backupFlash ? " btn-ghost-active" : ""}`} onClick={backupData} title="Download a full backup of your ledger as a JSON file"><Download size={15} /> {backupFlash ? "Saved!" : "Backup"}</button>
           <button className={`btn-ghost${reportFlash ? " btn-ghost-active" : ""}`} onClick={generateReport}><ArrowUpRight size={15} /> {reportFlash ? "Copied! 🎉" : "Share"}</button>
         </div>
       </header>
