@@ -206,6 +206,7 @@ const BANKS = [
   { key: "hdfc_bank",     label: "HDFC Bank (Savings)",    auto: true  },
   { key: "sbi_srp",       label: "SBI SRP",                auto: false },
   { key: "sbi_sid",       label: "SBI Sid",                auto: false },
+  { key: "sbi_mn",        label: "SBI MN",                 auto: false },
 ];
 
 const mIdx = (k) => Number(k.slice(5, 7)) - 1;
@@ -248,6 +249,7 @@ export default function ExpenseLedger() {
   const [view, setView] = useState("dashboard");
   const [editingId, setEditingId] = useState(null);
   const [editForm, setEditForm] = useState({});
+  const [entrySearch, setEntrySearch] = useState("");
 
   /* ---- load once (with name-based expense remap on reseed) ---- */
   useEffect(() => {
@@ -760,11 +762,43 @@ export default function ExpenseLedger() {
           <h2>{monthLabel(selMonth, { month: "long" })} entries</h2>
           {monthExpenses.length === 0 && expenses.length === 0 && (<button className="btn-sample" onClick={loadSample}><Sparkles size={14} /> Load sample month</button>)}
         </div>
+        {monthExpenses.length > 0 && (
+          <div className="entry-search">
+            <Search size={15} />
+            <input
+              type="text"
+              value={entrySearch}
+              onChange={(ev) => setEntrySearch(ev.target.value)}
+              placeholder="Search this month — category, note, account or amount"
+              aria-label="Search entries"
+            />
+            {entrySearch && (
+              <button className="icon-btn" aria-label="Clear search" onClick={() => setEntrySearch("")}><X size={14} /></button>
+            )}
+          </div>
+        )}
         {monthExpenses.length === 0 ? (
           <div className="empty">No expenses logged for this month yet.</div>
-        ) : (
+        ) : (() => {
+          const q = entrySearch.trim().toLowerCase();
+          const filtered = monthExpenses.filter((e) => {
+            if (!q) return true;
+            const bankLbl = BANKS.find((b) => b.key === e.bank)?.label || (e.src === "import" ? e.bank : "");
+            const hay = [
+              catById[e.cat]?.name || "Uncategorised",
+              e.note || "",
+              bankLbl || "",
+              e.person || "",
+              String(e.amount),
+            ].join(" ").toLowerCase();
+            return hay.includes(q);
+          });
+          if (filtered.length === 0) {
+            return <div className="empty">No entries match “{entrySearch}”.</div>;
+          }
+          return (
           <ul className="entries">
-            {monthExpenses.slice().sort((a, b) => b.date.localeCompare(a.date)).map((e) => {
+            {filtered.slice().sort((a, b) => b.date.localeCompare(a.date)).map((e) => {
               if (editingId === e.id) {
                 return (
                   <li key={e.id} className="en-edit">
@@ -805,7 +839,8 @@ export default function ExpenseLedger() {
               );
             })}
           </ul>
-        )}
+          );
+        })()}
       </section>
 
       </>)}
@@ -1498,6 +1533,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
                 <select className="sbi-pwd" style={{ flex: "0 0 auto", width: "auto" }} value={sbiOwner} onChange={(e) => setSbiOwner(e.target.value)}>
                   <option value="sbi_srp">SBI SRP</option>
                   <option value="sbi_sid">SBI Sid</option>
+                  <option value="sbi_mn">SBI MN</option>
                 </select>
                 <input
                   type="password"
@@ -1863,7 +1899,7 @@ function Styles() {
 .stmt-item.done .stmt-check{background:var(--teal); border-color:var(--teal); color:#fff;}
 
 .entries{list-style:none; margin:0; padding:0; display:flex; flex-direction:column;}
-.entries li{display:grid; grid-template-columns:88px 1.1fr 90px 1.4fr auto 30px 30px; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid var(--hairline); font-size:13px;}
+.entries li{display:grid; grid-template-columns:82px 1.05fr 120px 1.35fr auto 30px 30px; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid var(--hairline); font-size:13px;}
 .entries li:last-child{border-bottom:0;}
 .en-date{font-size:12px; color:var(--muted);}
 .en-cat{font-weight:500;}
@@ -1973,7 +2009,7 @@ function Styles() {
   .grid{grid-template-columns:1fr;}
   .logform{grid-template-columns:1fr 1fr;}
   .logform .btn-add{grid-column:1 / -1;}
-  .entries li{grid-template-columns:64px 1fr auto 28px 28px;}
+  .entries li{grid-template-columns:60px 1fr 92px auto 28px 28px;}
   .entries li.en-edit{grid-template-columns:1fr 1fr; row-gap:6px;}
   .en-edit-btns{grid-column:1/-1; justify-content:flex-start;}
   .en-note{display:none;}
@@ -1982,7 +2018,10 @@ function Styles() {
   .rev-row .catsel{grid-column:1 / -1; padding-left:26px;}
 }
 @media (prefers-reduced-motion:reduce){ .seg,.usebar-fill{transition:none;} }
-.en-bank{font-size:11px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.en-bank{font-size:11px;color:var(--muted);font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;background:var(--surface);border:1px solid var(--hairline);border-radius:6px;padding:3px 8px;justify-self:start;max-width:100%;}
+.entry-search{display:flex;align-items:center;gap:8px;margin:2px 0 12px;background:var(--surface);border:1px solid var(--hairline);border-radius:10px;padding:0 11px;color:var(--muted);}
+.entry-search input{border:0;background:transparent;padding:10px 4px;width:100%;font-size:13px;font-family:inherit;color:var(--ink);outline:none;}
+.entry-search .icon-btn{flex:0 0 auto;}
 .person-row{display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:4px;}
 .person-btn{border:1px solid var(--border);border-radius:12px;padding:2px 8px;font-size:11px;cursor:pointer;background:transparent;color:var(--ink);line-height:1.6;}
 .person-btn.on{background:var(--teal);color:#fff;border-color:var(--teal);}
