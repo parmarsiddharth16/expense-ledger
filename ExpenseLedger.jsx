@@ -138,10 +138,49 @@ const buildIncome = () => [
  * stay on the device only.
  * ---------------------------------------------------------------------- */
 const SENSITIVE = /Pwd$/; // password keys never leave the device
+
+/* The ledger passcode. Held in this tab only, mirrored to localStorage so a
+ * reload doesn't ask again, and sent as a header on every API call. It is not
+ * part of the synced payload — SENSITIVE keeps *Pwd keys local, and this never
+ * enters the cache at all. */
+export const auth = {
+  pass: (() => { try { return localStorage.getItem("ledger:passPwd") || ""; } catch { return ""; } })(),
+  needed: false,
+  set(p) {
+    this.pass = p || "";
+    try { p ? localStorage.setItem("ledger:passPwd", p) : localStorage.removeItem("ledger:passPwd"); } catch {}
+  },
+  headers(extra) {
+    const h = { ...(extra || {}) };
+    if (this.pass) h["x-ledger-pass"] = this.pass;
+    return h;
+  },
+};
+
+/** fetch wrapper that attaches the passcode and flags a 401 back to the app. */
+export async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: auth.headers({ ...(opts.headers || {}), ...(opts.body ? { "Content-Type": "application/json" } : {}) }),
+  });
+  let json = null;
+  try { json = await res.json(); } catch {}
+  if (res.status === 401 || (json && json.needsPasscode)) {
+    auth.needed = true;
+    window.dispatchEvent(new CustomEvent("ledger:needs-passcode"));
+    throw new Error(json?.error || "Passcode required.");
+  }
+  if (!res.ok || (json && json.ok === false)) {
+    throw new Error((json && json.error) || `Request failed (${res.status})`);
+  }
+  return json;
+}
+
 const store = {
   cache: null,
   ready: false,
   _timer: null,
+  protectedRemote: null, // null = unknown, false = API is open to anyone
   async init() {
     if (this.ready) return;
     this.cache = {};
@@ -156,9 +195,16 @@ const store = {
     } catch {}
     // overlay the cloud copy (source of truth across devices)
     try {
-      const res = await fetch("/api/data", { cache: "no-store" });
+      const res = await fetch("/api/data", { cache: "no-store", headers: auth.headers() });
+      if (res.status === 401) {
+        auth.needed = true;
+        this.ready = true;
+        window.dispatchEvent(new CustomEvent("ledger:needs-passcode"));
+        return;
+      }
       if (res.ok) {
         const json = await res.json();
+        this.protectedRemote = !!(json && json.protected);
         const remote = json && json.data;
         if (remote && typeof remote === "object" && Object.keys(remote).length) {
           this.cache = { ...this.cache, ...remote };
@@ -185,17 +231,25 @@ const store = {
   async _sync() {
     const payload = {};
     for (const k in this.cache) if (!SENSITIVE.test(k)) payload[k] = this.cache[k];
+    // never push an empty ledger over a populated one
+    if (!Object.keys(payload).length) return;
     try {
       await fetch("/api/data", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: auth.headers({ "Content-Type": "application/json" }),
         body: JSON.stringify({ data: payload }),
       });
     } catch { /* stays in localStorage; retries on next change */ }
   },
 };
 const K_CATS = "ledger:categories", K_EXP = "ledger:expenses", K_SET = "ledger:settings", K_INC = "ledger:income";
-const K_MAP = "ledger:merchantMap", K_STMTS = "ledger:stmts";
+const K_MAP = "ledger:merchantMap", K_STMTS = "ledger:stmts", K_AUDIT = "ledger:audit";
+
+/* Transactions the categoriser would not guess at are parked under this id.
+ * It deliberately isn't a real category, so the dashboard already rolls it into
+ * "Uncategorised spend" — the money counts against the month from the moment it
+ * is imported, it just isn't attributed yet. Nothing is ever silently dropped. */
+const SUSPENSE_ID = "__suspense__";
 const CAT_VERSION = 6;
 
 const BANKS = [
@@ -235,6 +289,10 @@ export default function ExpenseLedger() {
   const [merchantMap, setMerchantMap] = useState({});
   const [hideEmpty, setHideEmpty] = useState(true);
   const [stmts, setStmts] = useState({});
+  const [auditLog, setAuditLog] = useState([]);
+  const [needsPass, setNeedsPass] = useState(false);
+  const [passInput, setPassInput] = useState("");
+  const [apiOpen, setApiOpen] = useState(false); // API reachable without a passcode
 
   const [fCat, setFCat] = useState("");
   const [fAmt, setFAmt] = useState("");
@@ -262,6 +320,7 @@ export default function ExpenseLedger() {
       const settings = (await store.get(K_SET)) || {};
       const mmap = (await store.get(K_MAP)) || {};
       const stmtsData = (await store.get(K_STMTS)) || {};
+      const auditData = (await store.get(K_AUDIT)) || [];
 
       if (ver !== CAT_VERSION || !cats || !cats.length) {
         const oldName = {};
@@ -291,16 +350,39 @@ export default function ExpenseLedger() {
       setExpenses(exps);
       setMerchantMap(mmap);
       setStmts(stmtsData);
+      setAuditLog(auditData);
       setSym(settings.sym || "₹");
+      setNeedsPass(!!auth.needed);
+      setApiOpen(store.protectedRemote === false);
       setLoading(false);
     })();
+
+    const onNeeds = () => setNeedsPass(true);
+    window.addEventListener("ledger:needs-passcode", onNeeds);
+    return () => window.removeEventListener("ledger:needs-passcode", onNeeds);
   }, []);
+
+  const submitPasscode = async (e) => {
+    e.preventDefault();
+    auth.set(passInput.trim());
+    try {
+      const j = await api("/api/data");
+      store.cache = { ...(store.cache || {}), ...(j.data || {}) };
+      setNeedsPass(false);
+      setPassInput("");
+      window.location.reload();
+    } catch {
+      auth.set("");
+      setPassInput("");
+    }
+  };
 
   const saveCats = useCallback((n) => { setCategories(n); store.set(K_CATS, n); }, []);
   const saveInc = useCallback((n) => { setIncome(n); store.set(K_INC, n); }, []);
   const saveExps = useCallback((n) => { setExpenses(n); store.set(K_EXP, n); }, []);
   const saveSym = useCallback((s) => { setSym(s); store.set(K_SET, { sym: s }); }, []);
   const saveStmts = useCallback((n) => { setStmts(n); store.set(K_STMTS, n); }, []);
+  const saveAudit = useCallback((n) => { setAuditLog(n); store.set(K_AUDIT, n); }, []);
 
   useEffect(() => { if (!fCat && categories.length) setFCat(categories[0].id); }, [categories, fCat]);
 
@@ -470,7 +552,7 @@ export default function ExpenseLedger() {
     } catch { alert(text); }
   };
 
-  const onImport = (newExpenses, newMap, bankSource) => {
+  const onImport = (newExpenses, newMap, bankSource, audit) => {
     saveExps([...newExpenses, ...expenses]);
     if (newMap) { setMerchantMap(newMap); store.set(K_MAP, newMap); }
     if (bankSource && newExpenses[0]?.date) {
@@ -478,8 +560,27 @@ export default function ExpenseLedger() {
       const cur = stmts[mk] || [];
       if (!cur.includes(bankSource)) saveStmts({ ...stmts, [mk]: [...cur, bankSource] });
     }
+    if (audit) saveAudit([audit, ...auditLog].slice(0, 300));
     setImportOpen(false);
     if (newExpenses[0]?.date) setSelMonth(newExpenses[0].date.slice(0, 7));
+    if (audit?.suspense) setView("suspense");
+  };
+
+  /* Clearing a Suspense row is the moment merchant memory learns something —
+   * the same payee should never land in Suspense twice for the same reason. */
+  const clearSuspense = (id, catId) => {
+    const row = expenses.find((e) => e.id === id);
+    if (!row || !catId) return;
+    saveExps(expenses.map((e) => (e.id === id
+      ? { ...e, cat: catId, prov: { layer: "manual", confidence: 1, reason: "cleared from Suspense" } }
+      : e)));
+    const mk = normMerchant(row.note);
+    if (mk) { const m = { ...merchantMap, [mk]: catId }; setMerchantMap(m); store.set(K_MAP, m); }
+    saveAudit([{
+      id: uid(), at: new Date().toISOString(), kind: "suspense-cleared",
+      note: row.note, amount: row.amount, bank: row.bank,
+      to: categories.find((c) => c.id === catId)?.name || catId,
+    }, ...auditLog].slice(0, 300));
   };
 
   const editCatAmount = (id, value) => {
@@ -531,6 +632,23 @@ export default function ExpenseLedger() {
 
   if (loading) return (<div className="ledger-root"><Styles /><div className="loading">Opening your ledger…</div></div>);
 
+  if (needsPass) return (
+    <div className="ledger-root"><Styles />
+      <div className="passgate">
+        <form className="passcard" onSubmit={submitPasscode}>
+          <h2>Manali's Ledger</h2>
+          <p>Enter the ledger passcode to continue.</p>
+          <input type="password" autoFocus value={passInput} placeholder="Passcode"
+                 onChange={(e) => setPassInput(e.target.value)} />
+          <button className="btn-add" type="submit" disabled={!passInput.trim()}>Unlock</button>
+        </form>
+      </div>
+    </div>
+  );
+
+  const suspenseRows = expenses.filter((e) => e.cat === SUSPENSE_ID)
+    .sort((a, b) => (b.date || "").localeCompare(a.date || "") || b.amount - a.amount);
+
   const selIdxLabel = monthLabel(selMonth);
 
   return (
@@ -554,6 +672,10 @@ export default function ExpenseLedger() {
           <button className="btn-ghost" onClick={() => setImportOpen(true)}><Upload size={15} /> Import</button>
           <button className="btn-ghost" onClick={() => setManageOpen(true)}><SlidersHorizontal size={15} /> Budgets</button>
           <button className={`btn-ghost${view === "analysis" ? " btn-ghost-active" : ""}`} onClick={() => setView(v => v === "analysis" ? "dashboard" : "analysis")}><BarChart2 size={15} /> Analysis</button>
+          <button className={`btn-ghost${view === "suspense" ? " btn-ghost-active" : ""}`} onClick={() => setView(v => v === "suspense" ? "dashboard" : "suspense")}>
+            <Info size={15} /> Suspense{suspenseRows.length ? <span className="pill-count">{suspenseRows.length}</span> : null}
+          </button>
+          <button className={`btn-ghost${view === "audit" ? " btn-ghost-active" : ""}`} onClick={() => setView(v => v === "audit" ? "dashboard" : "audit")}><Check size={15} /> Audit</button>
           <button className={`btn-ghost${backupFlash ? " btn-ghost-active" : ""}`} onClick={backupData} title="Download a full backup of your ledger as a JSON file"><Download size={15} /> {backupFlash ? "Saved!" : "Backup"}</button>
           <button className={`btn-ghost${reportFlash ? " btn-ghost-active" : ""}`} onClick={generateReport}><ArrowUpRight size={15} /> {reportFlash ? "Copied! 🎉" : "Share"}</button>
         </div>
@@ -638,8 +760,20 @@ export default function ExpenseLedger() {
         </div>
       )}
 
+      {apiOpen && (
+        <div className="openwarn">
+          <Info size={15} /> This ledger is readable and writable by anyone who knows its web address.
+          Set <code>LEDGER_PASSCODE</code> in the Vercel project settings to lock it.
+        </div>
+      )}
+
       {view === "analysis" ? (
         <AnalysisView grouped={grouped} sym={sym} selMonth={selMonth} expenses={expenses} categories={categories} catById={catById} />
+      ) : view === "suspense" ? (
+        <SuspenseView rows={suspenseRows} categories={categories} sym={sym} onClear={clearSuspense}
+                      onDelete={(id) => saveExps(expenses.filter((e) => e.id !== id))} />
+      ) : view === "audit" ? (
+        <AuditView log={auditLog} sym={sym} />
       ) : (<>
       <div className="grid">
         {/* ledger */}
@@ -1136,6 +1270,119 @@ function parseDate(str, fmt) {
   if (!d || !m || !y || m > 12 || d > 31) return null;
   return `${y}-${pad2(m)}-${pad2(d)}`;
 }
+function SuspenseView({ rows, categories, sym, onClear, onDelete }) {
+  const [q, setQ] = useState("");
+  const [pick, setPick] = useState({});
+  const shown = rows.filter((r) => !q || (r.note || "").toLowerCase().includes(q.toLowerCase()));
+  const total = rows.reduce((s, r) => s + r.amount, 0);
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>Suspense</h2>
+        <span className="sub num">{rows.length} entr{rows.length === 1 ? "y" : "ies"} · {money(total, sym)}</span>
+      </div>
+      {!rows.length ? (
+        <div className="empty">Nothing in suspense — every imported transaction has a category.</div>
+      ) : (<>
+        <div className="imp-readnote">
+          <Info size={14} /> These couldn't be matched to a category confidently, so they were parked here rather than guessed at.
+          They already count towards the month's spend as "Uncategorised". Picking a category here also teaches the merchant memory,
+          so the same payee won't come back to suspense.
+        </div>
+        <div className="rev-tools">
+          <div className="rev-search"><Search size={14} /><input placeholder="Filter…" value={q} onChange={(e) => setQ(e.target.value)} /></div>
+        </div>
+        <div className="rev-list">
+          {shown.map((r) => (
+            <div className="rev-row" key={r.id}>
+              <div className="rev-main">
+                <span className="rev-desc">{r.note || "—"}</span>
+                <span className="rev-meta num">{r.date} · {money(r.amount, sym)} · {r.bank || "—"}</span>
+                {r.prov?.reason && <span className="susp-why">{r.prov.reason}</span>}
+              </div>
+              <CatSelect categories={categories} value={pick[r.id] || ""}
+                onChange={(v) => { setPick({ ...pick, [r.id]: v }); onClear(r.id, v); }}
+                hint="← file it" />
+              <button className="btn-ghost sm" title="Remove this entry entirely"
+                onClick={() => { if (window.confirm("Delete this entry? It will stop counting towards the month.")) onDelete(r.id); }}>
+                <Trash2 size={14} />
+              </button>
+            </div>
+          ))}
+          {!shown.length && <div className="empty">Nothing matches that filter.</div>}
+        </div>
+      </>)}
+    </section>
+  );
+}
+
+function AuditView({ log, sym }) {
+  const runs = log.filter((r) => !r.kind);
+  const clears = log.filter((r) => r.kind === "suspense-cleared");
+  const csv = () => {
+    const head = ["when","bank","file","month","found","imported","suspense","duplicates","total","extraction","balanceOk","balanceBreaks","layers"];
+    const rows = runs.map((r) => [
+      r.at, r.bank || "", r.file || "", r.month || "", r.found, r.imported, r.suspense, r.skippedAsDuplicate, r.total,
+      r.extraction?.source || "", r.extraction?.balanceCheck ? (r.extraction.balanceCheck.ok ? "yes" : "no") : "n/a",
+      r.extraction?.balanceCheck?.breaks ?? "", Object.entries(r.byLayer || {}).map(([k, v]) => k + ":" + v).join(" "),
+    ]);
+    const body = [head, ...rows].map((r) => r.map((c) => `"${String(c ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([body], { type: "text/csv" }));
+    a.download = "ledger-audit.csv";
+    a.click();
+  };
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>Audit trail</h2>
+        <button className="btn-ghost sm" onClick={csv} disabled={!runs.length}><Download size={14} /> Export CSV</button>
+      </div>
+      {!log.length ? <div className="empty">No imports recorded yet.</div> : (
+        <div className="audit-list">
+          {runs.map((r) => (
+            <div className="audit-run" key={r.id}>
+              <div className="audit-top">
+                <strong>{r.bank || "import"}</strong>
+                <span className="num">{new Date(r.at).toLocaleString()}</span>
+              </div>
+              <div className="audit-body">
+                <span>{r.file}</span>
+                <span className="num">{r.imported} of {r.found} imported · {money(r.total, sym)}</span>
+                {r.suspense > 0 && <span className="audit-warn">{r.suspense} to suspense</span>}
+                {r.skippedAsDuplicate > 0 && <span>{r.skippedAsDuplicate} duplicates skipped</span>}
+                {r.extraction && (
+                  <span>read via {r.extraction.source}
+                    {r.extraction.balanceCheck &&
+                      (r.extraction.balanceCheck.ok
+                        ? ` · balance verified across ${r.extraction.balanceCheck.checked} rows`
+                        : ` · balance broke on ${r.extraction.balanceCheck.breaks} rows`)}
+                  </span>
+                )}
+                <span className="audit-layers">
+                  {Object.entries(r.byLayer || {}).map(([k, v]) => <span key={k} className={"prov-tag prov-" + k}>{k} {v}</span>)}
+                </span>
+              </div>
+            </div>
+          ))}
+          {clears.length > 0 && (
+            <div className="audit-run">
+              <div className="audit-top"><strong>Suspense cleared</strong><span className="num">{clears.length} entries</span></div>
+              <div className="audit-body">
+                {clears.slice(0, 25).map((c) => (
+                  <span key={c.id}>{new Date(c.at).toLocaleDateString()} · {(c.note || "").slice(0, 34)} → {c.to}</span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function normMerchant(desc) {
   return (desc || "").toUpperCase().replace(/[^A-Z ]/g, " ").split(/\s+/).filter((w) => w.length > 2).slice(0, 3).join(" ");
 }
@@ -1200,22 +1447,10 @@ function salvageJSON(text) {
   return [];
 }
 const toISODate = (d) => { const s = String(d || "").trim(); if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s; return parseDate(s, "DMY") || ""; };
-async function extractViaAPI(b64, media, isPdf) {
-  const block = isPdf
-    ? { type: "document", source: { type: "base64", media_type: media, data: b64 } }
-    : { type: "image", source: { type: "base64", media_type: media, data: b64 } };
-  const prompt = "Extract EVERY transaction from this bank or credit-card statement. Return ONLY a JSON array — no prose, no markdown fences. Each element must be {\"date\":\"YYYY-MM-DD\",\"description\":\"merchant or narration\",\"amount\":<positive number>,\"kind\":\"debit\"|\"credit\"}. kind=\"debit\" = money spent, withdrawn, or a purchase; kind=\"credit\" = money received, a refund, or a payment toward the card. Infer the year from the statement. Exclude opening/closing balances and summary totals. If you cannot read it, return [].";
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, messages: [{ role: "user", content: [block, { type: "text", text: prompt }] }] }),
-  });
-  if (!res.ok) throw new Error("api " + res.status);
-  const json = await res.json();
-  const text = (json.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
-  return salvageJSON(text)
-    .filter((t) => t && (t.kind ? t.kind === "debit" : true) && Number(t.amount) > 0)
-    .map((t) => ({ date: toISODate(t.date), description: String(t.description || ""), amount: Math.abs(Number(t.amount)) }));
-}
+/* extractViaAPI used to live here. It POSTed the statement straight to
+ * api.anthropic.com from the browser with no API key attached, so it always
+ * failed — and had a key been added it would have been readable by anyone who
+ * opened the page. Extraction is now a server call: see /api/extract. */
 
 function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImport }) {
   const [step, setStep] = useState("upload");
@@ -1245,20 +1480,33 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
   const [bankSource, setBankSource] = useState(null);
   const [dup, setDup] = useState({});
   const [personAssign, setPersonAssign] = useState({});
+  const [progress, setProgress] = useState("");
+  const [diag, setDiag] = useState(null);        // how the statement was read
+  const [catSummary, setCatSummary] = useState(null); // how categorisation went
+  const [autoBy, setAutoBy] = useState({});      // key -> {layer, confidence, reason, candidates}
   const dupKey = (date, amount, desc) => `${date}|${Math.round(amount)}|${normMerchant(desc)}`;
   const existingKeys = useMemo(() => new Set((existing || []).map((e) => dupKey(e.date, e.amount, e.note))), [existing]);
   const catById = useMemo(() => Object.fromEntries((categories || []).map((c) => [c.id, c])), [categories]);
 
   const toReview = (out, fromAPI) => {
     if (!out.length) { setErr("No expense transactions were found. For tabular files, check the column mapping; for PDFs, try a clearer copy or a CSV/Excel export."); if (fromAPI) setStep("upload"); return; }
-    const asg = {}, inc = {}, dp = {};
+    const asg = {}, inc = {}, dp = {}, by = {};
     out.forEach((t) => {
       const isDup = existingKeys.has(dupKey(t.date, t.amount, t.desc));
       dp[t.key] = isDup; inc[t.key] = !isDup;
-      const mk = normMerchant(t.desc);
-      if (mk && merchantMap[mk]) asg[t.key] = merchantMap[mk];
+      if (t.auto && t.auto.cat) {
+        asg[t.key] = t.auto.cat;
+        by[t.key] = t.auto;
+      } else if (t.auto) {
+        by[t.key] = t.auto; // a refusal, with its reason and near misses
+      } else {
+        // tabular imports that never went through the categoriser
+        const mk = normMerchant(t.desc);
+        if (mk && merchantMap[mk]) asg[t.key] = merchantMap[mk];
+      }
     });
-    setTxns(out); setAssign(asg); setInclude(inc); setDup(dp); setPersonAssign({}); setViaAPI(!!fromAPI); setErr(""); setStep("review");
+    setTxns(out); setAssign(asg); setInclude(inc); setDup(dp); setPersonAssign({});
+    setAutoBy(by); setViaAPI(!!fromAPI); setErr(""); setProgress(""); setStep("review");
   };
 
   const handleFile = async (e) => {
@@ -1270,12 +1518,11 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
     const isDoc = nm.endsWith(".pdf") || /\.(png|jpe?g|webp)$/.test(nm);
     try {
       if (isDoc) {
-        setStep("loading");
-        const b64 = await fileToB64(f);
-        const isPdf = nm.endsWith(".pdf");
-        const media = isPdf ? "application/pdf" : nm.endsWith(".png") ? "image/png" : nm.endsWith(".webp") ? "image/webp" : "image/jpeg";
-        const list = await extractViaAPI(b64, media, isPdf);
-        toReview(list.map((t, i) => ({ key: "a" + i, date: t.date, desc: t.description.trim(), amount: t.amount })), true);
+        if (!nm.endsWith(".pdf")) {
+          setErr("Images aren't supported — upload the PDF statement itself, or a CSV/Excel export.");
+          return;
+        }
+        await importStatement(f, genericBank, "");
         return;
       }
       let parsed = [];
@@ -1302,143 +1549,81 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
   };
 
 
-  const handleSBIFile = async (e) => {
-    const f = e.target.files?.[0]; if (!f) return;
-    e.target.value = "";
-    setErr(""); setFileName(f.name);
-    if (!sbiPwd.trim()) { setErr("Enter your SBI statement password first."); return; }
-    try { localStorage.setItem("ledger:sbiPwd", sbiPwd); } catch {}
-    setStep("loading");
+  /* ------------------------------------------------------------------
+   * One import path for every bank and card.
+   *
+   * The five handlers that used to live here each POSTed to /api/decrypt,
+   * which was never deployed — so every one of them failed. They are replaced
+   * by a single call to /api/extract, which decrypts the PDF server-side,
+   * reads the money columns and verifies the running balance before handing
+   * anything back.
+   * ---------------------------------------------------------------- */
+  const importStatement = async (file, bank, password) => {
+    setErr(""); setFileName(file.name); setBankSource(bank);
+    setStep("loading"); setProgress("Opening " + file.name + "…");
     try {
-      const b64 = await fileToB64(f);
-      const res = await fetch("/api/decrypt", {
+      const b64 = await fileToB64(file);
+      const ex = await api("/api/extract", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ file: b64, password: sbiPwd.trim() }),
+        body: JSON.stringify({ file: b64, password: password || "", bank, filename: file.name,
+                               yearHint: new Date().getFullYear() }),
       });
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || "Decryption failed");
-      const list = data.transactions.map((t, i) => ({
-        key: "sbi" + i, date: t.date, desc: t.description, amount: t.amount,
+      setDiag(ex.diagnostics || null);
+
+      const debits = (ex.transactions || []).filter((t) => t.kind !== "credit");
+      if (!debits.length) {
+        setErr((ex.transactions || []).length
+          ? "That statement only contained credits — nothing to add as spend."
+          : "No transactions could be read from that statement.");
+        setStep("upload");
+        return;
+      }
+
+      setProgress(`Categorising ${debits.length} transactions…`);
+      let results = [];
+      try {
+        const cat = await api("/api/categorize", {
+          method: "POST",
+          body: JSON.stringify({
+            transactions: debits.map((t) => ({ description: t.description, amount: t.amount, bank, date: t.date })),
+          }),
+        });
+        results = cat.results || [];
+        setCatSummary(cat.summary || null);
+      } catch (ce) {
+        // categorisation is an accelerator, not a gate — fall back to manual
+        setCatSummary({ error: String(ce.message || ce) });
+      }
+
+      const list = debits.map((t, i) => ({
+        key: bank + i, date: t.date, desc: t.description, amount: t.amount,
+        auto: results[i] || null,
       }));
-      setBankSource(sbiOwner);
-      toReview(list, false);
+      toReview(list, ex.diagnostics?.source === "claude");
     } catch (ex) {
       console.error(ex);
-      setErr("Could not decrypt: " + (ex.message || "check password and try again."));
+      setErr(String(ex.message || ex));
       setStep("upload");
     }
   };
 
-  const handleUBIFile = async (e) => {
+  const onBankFile = (bank, pwdValue, pwdKey) => async (e) => {
     const f = e.target.files?.[0]; if (!f) return;
     e.target.value = "";
-    setErr(""); setFileName(f.name);
-    setStep("loading");
-    try {
-      const b64 = await fileToB64(f);
-      const res = await fetch("/api/decrypt", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ file: b64, password: "", bank: "ubi" }),
-      });
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || "Parsing failed");
-      const list = data.transactions.map((t, i) => ({
-        key: "ubi" + i, date: t.date, desc: t.description, amount: t.amount,
-      }));
-      setBankSource("ubi");
-      toReview(list, false);
-    } catch (ex) {
-      console.error(ex);
-      setErr("Could not parse UBI statement: " + (ex.message || "try again."));
-      setStep("upload");
+    const needsPwd = pwdKey !== null;
+    if (needsPwd && !String(pwdValue || "").trim()) {
+      setErr("Enter the statement password first.");
+      return;
     }
+    if (pwdKey) { try { localStorage.setItem(pwdKey, pwdValue); } catch {} }
+    await importStatement(f, bank, pwdValue);
   };
 
-  const handleBOMFile = async (e) => {
-    const f = e.target.files?.[0]; if (!f) return;
-    e.target.value = "";
-    setErr(""); setFileName(f.name);
-    if (!bomPwd.trim()) { setErr("Enter your Bank of Maharashtra statement password first."); return; }
-    try { localStorage.setItem("ledger:bomPwd", bomPwd); } catch {}
-    setStep("loading");
-    try {
-      const b64 = await fileToB64(f);
-      const res = await fetch("/api/decrypt", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ file: b64, password: bomPwd.trim(), bank: "bom" }),
-      });
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || "Decryption failed");
-      const list = data.transactions.map((t, i) => ({
-        key: "bom" + i, date: t.date, desc: t.description, amount: t.amount,
-      }));
-      setBankSource("bom");
-      toReview(list, false);
-    } catch (ex) {
-      console.error(ex);
-      setErr("Could not decrypt: " + (ex.message || "check password and try again."));
-      setStep("upload");
-    }
-  };
-
-  const handleHDFCBankFile = async (e) => {
-    const f = e.target.files?.[0]; if (!f) return;
-    e.target.value = "";
-    setErr(""); setFileName(f.name);
-    if (!hdfcBankPwd.trim()) { setErr("Enter your HDFC Bank statement password first."); return; }
-    try { localStorage.setItem("ledger:hdfcBankPwd", hdfcBankPwd); } catch {}
-    setStep("loading");
-    try {
-      const b64 = await fileToB64(f);
-      const res = await fetch("/api/decrypt", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ file: b64, password: hdfcBankPwd.trim(), bank: "hdfc_bank" }),
-      });
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || "Decryption failed");
-      const list = data.transactions.map((t, i) => ({
-        key: "hdfcbank" + i, date: t.date, desc: t.description, amount: t.amount,
-      }));
-      setBankSource("hdfc_bank");
-      toReview(list, false);
-    } catch (ex) {
-      console.error(ex);
-      setErr("Could not decrypt: " + (ex.message || "check password and try again."));
-      setStep("upload");
-    }
-  };
-
-  const handleCCFile = async (e) => {
-    const f = e.target.files?.[0]; if (!f) return;
-    e.target.value = "";
-    setErr(""); setFileName(f.name);
-    if (!ccPwd.trim()) { setErr("Enter your credit card statement password first."); return; }
-    try { localStorage.setItem("ledger:ccPwd", ccPwd); } catch {}
-    setStep("loading");
-    try {
-      const b64 = await fileToB64(f);
-      const res = await fetch("/api/decrypt", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ file: b64, password: ccPwd.trim(), bank: "hdfc_cc" }),
-      });
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || "Decryption failed");
-      const list = data.transactions.map((t, i) => ({
-        key: "cc" + i, date: t.date, desc: t.description, amount: t.amount,
-      }));
-      setBankSource(ccCardType);
-      toReview(list, false);
-    } catch (ex) {
-      console.error(ex);
-      setErr("Could not decrypt: " + (ex.message || "check password and try again."));
-      setStep("upload");
-    }
-  };
+  const handleSBIFile = onBankFile(sbiOwner, sbiPwd, "ledger:sbiPwd");
+  const handleUBIFile = onBankFile("ubi", "", null);
+  const handleBOMFile = onBankFile("bom", bomPwd, "ledger:bomPwd");
+  const handleHDFCBankFile = onBankFile("hdfc_bank", hdfcBankPwd, "ledger:hdfcBankPwd");
+  const handleCCFile = onBankFile(ccCardType, ccPwd, "ledger:ccPwd");
 
   const headerCells = rows[headerRow] || [];
   const colOpts = headerCells.map((h, i) => ({ i, label: colLabel(i, h) }));
@@ -1476,20 +1661,68 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
   };
 
   const doImport = () => {
-    const picked = txns.filter((t) => include[t.key] && assign[t.key]);
+    // Everything ticked is imported. A row with no category is not dropped and
+    // does not block the batch — it goes to Suspense, where it still counts
+    // against the month's spend until it is cleared.
+    const picked = txns.filter((t) => include[t.key]);
     if (!picked.length) return;
-    const expenses = picked.map((t) => ({
-      id: uid(), cat: assign[t.key], amount: t.amount,
-      date: t.date || new Date().toISOString().slice(0, 10),
-      note: t.desc || "Imported", src: "import", bank: bankSource,
-      ...(personAssign[t.key] && { person: personAssign[t.key] }),
-    }));
+
+    const expenses = picked.map((t) => {
+      const cat = assign[t.key] || SUSPENSE_ID;
+      const auto = autoBy[t.key];
+      const manual = !auto || auto.cat !== assign[t.key];
+      return {
+        id: uid(), cat, amount: t.amount,
+        date: t.date || new Date().toISOString().slice(0, 10),
+        note: t.desc || "Imported", src: "import", bank: bankSource,
+        ...(personAssign[t.key] && { person: personAssign[t.key] }),
+        // provenance: how this row got the category it has
+        prov: cat === SUSPENSE_ID
+          ? { layer: "suspense", reason: auto?.reason || "not categorised at import" }
+          : { layer: manual ? "manual" : auto.layer,
+              confidence: manual ? 1 : auto.confidence,
+              reason: manual ? "chosen at import" : auto.reason },
+      };
+    });
+
+    // Merchant memory learns from what was actually confirmed — and only from
+    // rows a human either chose or accepted, never from a Suspense row.
     let newMap = null;
     if (remember) {
       newMap = { ...merchantMap };
-      picked.forEach((t) => { const mk = normMerchant(t.desc); if (mk) newMap[mk] = assign[t.key]; });
+      picked.forEach((t) => {
+        if (!assign[t.key]) return;
+        const mk = normMerchant(t.desc);
+        if (mk) newMap[mk] = assign[t.key];
+      });
     }
-    onImport(expenses, newMap, bankSource);
+
+    const byLayer = {};
+    for (const e of expenses) byLayer[e.prov.layer] = (byLayer[e.prov.layer] || 0) + 1;
+    const audit = {
+      id: uid(),
+      at: new Date().toISOString(),
+      bank: bankSource,
+      file: fileName,
+      month: expenses[0]?.date?.slice(0, 7) || "",
+      found: txns.length,
+      imported: expenses.length,
+      skippedAsDuplicate: txns.filter((t) => dup[t.key] && !include[t.key]).length,
+      suspense: expenses.filter((e) => e.cat === SUSPENSE_ID).length,
+      total: +expenses.reduce((s, e) => s + e.amount, 0).toFixed(2),
+      byLayer,
+      extraction: diag ? {
+        source: diag.source, pages: diag.pages, columns: diag.columns,
+        balanceCheck: diag.balanceCheck ? {
+          checked: diag.balanceCheck.checked,
+          ok: diag.balanceCheck.ok,
+          breaks: diag.balanceCheck.breakCount,
+        } : null,
+      } : null,
+      categoriser: catSummary || null,
+    };
+
+    onImport(expenses, newMap, bankSource, audit);
   };
 
   return (
@@ -1692,19 +1925,26 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
         {step === "review" && (() => {
           const includedCount = txns.filter((t) => include[t.key]).length;
           const uncatCount = txns.filter((t) => include[t.key] && !assign[t.key]).length;
-          const canImport = assignedCount > 0 && uncatCount === 0;
+          const autoCount = txns.filter((t) => include[t.key] && assign[t.key] && autoBy[t.key]?.cat === assign[t.key]).length;
+          const canImport = includedCount > 0;
           return (
           <div className="imp-body">
             <div className="rev-summary">
               <strong>{txns.length}</strong> found · <strong>{includedCount}</strong> selected
-              {uncatCount > 0
-                ? <span className="rev-uncat"> · <strong>{uncatCount}</strong> still need a category ↓</span>
-                : assignedCount > 0 ? <span style={{color:"var(--teal)"}}> · all categorised ✓</span> : null}
+              {autoCount > 0 && <span style={{color:"var(--teal)"}}> · <strong>{autoCount}</strong> categorised automatically</span>}
+              {uncatCount > 0 && <span className="rev-uncat"> · <strong>{uncatCount}</strong> → Suspense</span>}
               {dupCount > 0 && <span className="rev-dupnote"> · {dupCount} look already imported (unticked)</span>}
             </div>
+            {diag?.balanceCheck && !diag.balanceCheck.ok && (
+              <div className="imp-readnote" style={{background:"#FFF5F5",borderColor:"#F3C9C9",color:"#B4232A"}}>
+                <Info size={14} /> The running balance doesn't add up on {diag.balanceCheck.breakCount} row
+                {diag.balanceCheck.breakCount === 1 ? "" : "s"} — an amount may have been misread. Check those against the PDF before saving.
+              </div>
+            )}
             {uncatCount > 0 && (
-              <div className="imp-readnote" style={{background:"#FFFBF4",borderColor:"#F0DBB8",color:"var(--amber)"}}>
-                <Info size={14} /> Pick a category for every ticked transaction before saving — uncategorised ones won't be imported.
+              <div className="imp-readnote">
+                <Info size={14} /> {uncatCount} transaction{uncatCount === 1 ? "" : "s"} couldn't be matched to a category with confidence.
+                You can pick now, or save and clear them later from the Suspense tab — either way the money still counts towards this month.
               </div>
             )}
             {viaAPI && <div className="imp-readnote"><Info size={14} /> Read from your statement by Claude — please sanity-check amounts and dates before importing.</div>}
@@ -1729,7 +1969,22 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
                     </div>
                     <CatSelect categories={categories} value={assign[t.key] || ""}
                       onChange={(v) => setAssign({ ...assign, [t.key]: v })}
-                      hint={assign[t.key] && merchantMap[normMerchant(t.desc)] === assign[t.key] ? "remembered from last time" : needsCat ? "← pick a category" : ""} />
+                      hint={autoBy[t.key]?.reason || (needsCat ? "← pick a category" : "")} />
+                    {autoBy[t.key] && (
+                      <div className="prov-row">
+                        {autoBy[t.key].cat === assign[t.key] && (
+                          <span className={"prov-tag prov-" + autoBy[t.key].layer}>
+                            {autoBy[t.key].layer} · {Math.round((autoBy[t.key].confidence || 0) * 100)}%
+                          </span>
+                        )}
+                        {needsCat && (autoBy[t.key].candidates || []).slice(0, 3).map((c) => (
+                          <button key={c.cat} type="button" className="prov-suggest"
+                            onClick={() => setAssign({ ...assign, [t.key]: c.cat })}>
+                            {categories.find((x) => x.id === c.cat)?.name || "?"}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                     {assign[t.key] && (
                       <div className="person-row">
                         {["Sid","Manali","Saryu"].map(p => {
@@ -1753,7 +2008,9 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
             <div className="imp-actions">
               <button className="btn-ghost" onClick={() => setStep("map")}>Back</button>
               <button className="btn-add" disabled={!canImport} onClick={doImport}>
-                <Check size={16} /> {canImport ? `Save ${assignedCount} expense${assignedCount === 1 ? "" : "s"}` : uncatCount > 0 ? `${uncatCount} still need a category` : "Select transactions above"}
+                <Check size={16} /> {canImport
+                  ? `Save ${includedCount} expense${includedCount === 1 ? "" : "s"}${uncatCount ? ` (${uncatCount} to Suspense)` : ""}`
+                  : "Select transactions above"}
               </button>
             </div>
           </div>
@@ -1957,6 +2214,45 @@ function Styles() {
 .dz-sub{font-size:12px; color:var(--muted); max-width:380px; line-height:1.45;}
 .dz-btn{margin-top:4px; background:var(--ink); color:#fff; border-radius:9px; padding:8px 16px; font-size:12.5px; font-weight:600;}
 .loadbox{display:flex; flex-direction:column; align-items:center; gap:10px; text-align:center; padding:40px 20px;}
+
+/* ---- passcode gate ---- */
+.passgate{min-height:70vh; display:flex; align-items:center; justify-content:center;}
+.passcard{background:#fff; border:1px solid var(--hairline); border-radius:14px; padding:28px 26px; width:min(360px,92vw); display:flex; flex-direction:column; gap:12px; box-shadow:0 8px 30px rgba(0,0,0,.06);}
+.passcard h2{margin:0; font-size:19px;}
+.passcard p{margin:0; font-size:13px; color:var(--faint);}
+.passcard input{padding:10px 12px; border:1px solid var(--hairline); border-radius:9px; font-size:15px;}
+
+/* ---- open-API warning ---- */
+.openwarn{display:flex; align-items:center; gap:8px; margin:0 0 14px; padding:10px 14px; border-radius:10px;
+  background:#FFF5F5; border:1px solid #F3C9C9; color:#B4232A; font-size:13px; flex-wrap:wrap;}
+.openwarn code{background:rgba(0,0,0,.05); padding:1px 5px; border-radius:4px; font-size:12px;}
+
+/* ---- provenance tags ---- */
+.pill-count{display:inline-block; margin-left:6px; min-width:18px; padding:0 5px; border-radius:9px;
+  background:var(--amber,#B7791F); color:#fff; font-size:11px; line-height:18px; text-align:center;}
+.prov-row{display:flex; gap:6px; align-items:center; flex-wrap:wrap; grid-column:1/-1; margin-top:2px;}
+.prov-tag{font-size:10.5px; letter-spacing:.03em; text-transform:uppercase; padding:2px 7px; border-radius:20px;
+  background:#EEF3F1; color:#4A6B60; border:1px solid #DCE7E3;}
+.prov-memory{background:#E9F4EF; color:#1F6B4D; border-color:#CBE5D8;}
+.prov-recurring{background:#EDF1FA; color:#33518F; border-color:#D3DDF2;}
+.prov-fuzzy{background:#FBF3E6; color:#8A6224; border-color:#EEDFC4;}
+.prov-ai{background:#F3EDFA; color:#63409B; border-color:#E1D4F2;}
+.prov-manual{background:#F1F1F1; color:#555; border-color:#E2E2E2;}
+.prov-suspense{background:#FDECEC; color:#A8323A; border-color:#F4D2D4;}
+.prov-suggest{font-size:11.5px; padding:2px 9px; border-radius:20px; cursor:pointer;
+  background:#fff; border:1px dashed var(--hairline); color:var(--ink);}
+.prov-suggest:hover{border-style:solid; border-color:var(--teal); color:var(--teal);}
+.susp-why{display:block; font-size:11.5px; color:var(--faint); margin-top:2px;}
+
+/* ---- audit ---- */
+.audit-list{display:flex; flex-direction:column; gap:10px; padding:4px 0;}
+.audit-run{border:1px solid var(--hairline); border-radius:11px; padding:12px 14px; background:#fff;}
+.audit-top{display:flex; justify-content:space-between; align-items:baseline; gap:10px; margin-bottom:6px;}
+.audit-top .num{font-size:12px; color:var(--faint);}
+.audit-body{display:flex; flex-direction:column; gap:3px; font-size:12.5px; color:var(--faint);}
+.audit-warn{color:var(--amber,#B7791F); font-weight:600;}
+.audit-layers{display:flex; gap:5px; flex-wrap:wrap; margin-top:5px;}
+@media (max-width:640px){ .audit-top{flex-direction:column; gap:2px;} }
 .spin{width:26px; height:26px; border-radius:50%; border:3px solid var(--hairline); border-top-color:var(--teal); animation:ledspin .8s linear infinite;}
 @keyframes ledspin{to{transform:rotate(360deg);}}
 .preview{overflow-x:auto; border:1px solid var(--hairline); border-radius:10px; background:var(--surface);}

@@ -1,50 +1,20 @@
-import { put, list } from "@vercel/blob";
+import { resolveToken, readLedger, writeLedger, readJsonBody } from "./_lib/blob.js";
+import { requirePasscode, isProtected } from "./_lib/auth.js";
 
 /*
- * Cloud persistence for the expense ledger.
- * Stores the entire app state as a single private JSON blob ("ledger.json").
- *   GET  /api/data   -> { ok: true, data: {...} }   (reads the blob)
- *   POST /api/data   -> { ok: true }                 (overwrites the blob)
+ * Cloud persistence for the expense ledger — the whole app state as one private
+ * JSON blob ("ledger.json").
+ *   GET  /api/data -> { ok, data, protected }
+ *   POST /api/data -> { ok }
  *
- * Requires a Vercel Blob read/write token. Vercel injects this when a Blob
- * store is connected to the project. The default name is BLOB_READ_WRITE_TOKEN,
- * but a *named* store gets a prefixed variable (e.g. mystore_READ_WRITE_TOKEN),
- * so we resolve whichever one is present.
+ * Both are behind the passcode gate once LEDGER_PASSCODE is set; until then the
+ * response carries protected:false so the app can warn that the ledger is open.
  */
 
-const KEY = "ledger.json";
-
-function resolveToken() {
-  if (process.env.BLOB_READ_WRITE_TOKEN) return process.env.BLOB_READ_WRITE_TOKEN;
-  // fall back to any Vercel Blob token variable, whatever its prefix
-  const name = Object.keys(process.env).find(
-    (k) => /READ_WRITE_TOKEN$/.test(k) && /BLOB/i.test(k)
-  );
-  return name ? process.env[name] : null;
-}
-
-async function readBlob(token) {
-  try {
-    const { blobs } = await list({ prefix: KEY, token });
-    const blob = blobs.find((b) => b.pathname === KEY) || blobs[0];
-    if (!blob) return {};
-    const res = await fetch(blob.url, {
-      cache: "no-store",
-      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-    });
-    if (!res.ok) return {};
-    return await res.json();
-  } catch {
-    return {};
-  }
-}
-
 export default async function handler(req, res) {
-  const token = resolveToken();
+  if (!requirePasscode(req, res)) return;
 
-  // If no Blob token is present, fail softly so the app falls back to
-  // local-only mode. Include the NAMES (never values) of blob-related env
-  // vars to make misconfiguration easy to diagnose.
+  const token = resolveToken();
   if (!token) {
     res.status(501).json({
       ok: false,
@@ -56,26 +26,30 @@ export default async function handler(req, res) {
 
   try {
     if (req.method === "GET") {
-      const data = await readBlob(token);
+      const data = await readLedger(token);
       res.setHeader("Cache-Control", "no-store");
-      res.status(200).json({ ok: true, data });
+      res.status(200).json({ ok: true, data, protected: isProtected() });
       return;
     }
 
     if (req.method === "POST" || req.method === "PUT") {
-      let body = req.body;
-      if (typeof body === "string") {
-        try { body = JSON.parse(body); } catch { body = {}; }
-      }
+      const body = await readJsonBody(req);
       const data = body && typeof body === "object" && body.data ? body.data : body || {};
-      await put(KEY, JSON.stringify(data), {
-        access: "private",
-        contentType: "application/json",
-        allowOverwrite: true,
-        addRandomSuffix: false,
-        token,
-      });
-      res.status(200).json({ ok: true });
+      if (!data || typeof data !== "object" || Array.isArray(data)) {
+        res.status(400).json({ ok: false, error: "Expected an object body." });
+        return;
+      }
+      // Refuse to overwrite a populated ledger with an empty one — a client that
+      // failed to load its state must never be able to blank the blob.
+      if (!Object.keys(data).length) {
+        const current = await readLedger(token);
+        if (Object.keys(current).length) {
+          res.status(409).json({ ok: false, error: "Refusing to overwrite the ledger with empty data." });
+          return;
+        }
+      }
+      await writeLedger(data, token);
+      res.status(200).json({ ok: true, protected: isProtected() });
       return;
     }
 

@@ -1,32 +1,83 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import ReactDOM from "react-dom/client";
-import ExpenseLedger from "../ExpenseLedger.jsx";
+import ExpenseLedger, { auth } from "../ExpenseLedger.jsx";
 
-/* Passcode gate: the dashboard is shown only after the access code is
-   entered. Unlock is remembered for the browser tab session. */
-const ACCESS_CODE = "2602";
+/*
+ * Access gate.
+ *
+ * This used to compare what you typed against a constant sitting in this file.
+ * That constant shipped inside the JavaScript bundle, so it was readable by
+ * anyone who opened the page — and it protected nothing anyway, because
+ * /api/data answered any request that reached it. The ledger was effectively
+ * public to anyone who knew the URL.
+ *
+ * Now the code is checked by the server: it is sent as the passcode header on a
+ * real request, and the ledger renders only if that request is accepted. The
+ * passcode itself lives in LEDGER_PASSCODE in the Vercel project and never
+ * ships to the browser.
+ *
+ * Until that variable is set the server accepts everything, so the old local
+ * code still opens the app rather than locking anyone out — but the app then
+ * shows a standing warning that the ledger is unprotected.
+ */
+
+const LEGACY_CODE = "2602";
 const GATE_KEY = "ledger:gate";
 
 function Gate() {
-  const [ok, setOk] = useState(() => {
-    try { return sessionStorage.getItem(GATE_KEY) === "ok"; } catch { return false; }
-  });
+  const [ok, setOk] = useState(false);
+  const [checking, setChecking] = useState(true);
   const [val, setVal] = useState("");
-  const [err, setErr] = useState(false);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  // A remembered passcode is re-verified on load, so revoking it on the server
+  // actually locks the app rather than leaving old sessions open.
+  useEffect(() => {
+    (async () => {
+      try {
+        if (sessionStorage.getItem(GATE_KEY) === "ok" || auth.pass) {
+          const res = await fetch("/api/data", { cache: "no-store", headers: auth.headers() });
+          if (res.ok) { setOk(true); setChecking(false); return; }
+          try { sessionStorage.removeItem(GATE_KEY); } catch {}
+          auth.set("");
+        }
+      } catch {
+        // offline: fall through to the prompt, the app works from its local cache
+      }
+      setChecking(false);
+    })();
+  }, []);
+
+  const submit = async (e) => {
+    if (e) e.preventDefault();
+    const code = val.trim();
+    if (!code) return;
+    setBusy(true); setErr("");
+    auth.set(code);
+    try {
+      const res = await fetch("/api/data", { cache: "no-store", headers: auth.headers() });
+      if (res.ok) {
+        const json = await res.json().catch(() => ({}));
+        // server has no passcode configured — accept only the legacy code, and
+        // keep it out of the auth header so nothing pretends this is protected
+        if (json && json.protected === false && code !== LEGACY_CODE) {
+          auth.set(""); setErr("Incorrect code — try again."); setVal(""); setBusy(false); return;
+        }
+        if (json && json.protected === false) auth.set("");
+        try { sessionStorage.setItem(GATE_KEY, "ok"); } catch {}
+        setOk(true); setBusy(false); return;
+      }
+      auth.set("");
+      setErr(res.status === 401 ? "Incorrect code — try again." : "Couldn't reach the ledger. Try again.");
+    } catch {
+      auth.set("");
+      setErr("Couldn't reach the ledger. Check your connection.");
+    }
+    setVal(""); setBusy(false);
+  };
 
   if (ok) return <ExpenseLedger />;
-
-  const submit = (e) => {
-    if (e) e.preventDefault();
-    if (val.trim() === ACCESS_CODE) {
-      try { sessionStorage.setItem(GATE_KEY, "ok"); } catch {}
-      setErr(false);
-      setOk(true);
-    } else {
-      setErr(true);
-      setVal("");
-    }
-  };
 
   const wrap = {
     minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
@@ -46,9 +97,14 @@ function Gate() {
   };
   const btn = {
     width: "100%", boxSizing: "border-box", marginTop: 14, padding: "12px 14px",
-    fontSize: 15, fontWeight: 600, color: "#fff", background: "#0f766e",
-    border: "none", borderRadius: 12, cursor: "pointer", fontFamily: "inherit",
+    fontSize: 15, fontWeight: 600, color: "#fff",
+    background: busy ? "#7fb3ad" : "#0f766e",
+    border: "none", borderRadius: 12, cursor: busy ? "default" : "pointer", fontFamily: "inherit",
   };
+
+  if (checking) {
+    return <div style={wrap}><div style={{ ...card, color: "#8a857c", fontSize: 14 }}>Checking…</div></div>;
+  }
 
   return (
     <div style={wrap}>
@@ -66,15 +122,13 @@ function Gate() {
           autoFocus
           placeholder="&#8226;&#8226;&#8226;&#8226;"
           value={val}
-          onChange={(e) => { setVal(e.target.value); if (err) setErr(false); }}
+          onChange={(e) => { setVal(e.target.value); if (err) setErr(""); }}
           aria-label="Access code"
         />
         {err && (
-          <div style={{ color: "#d9534f", fontSize: 12.5, marginTop: 8 }}>
-            Incorrect code &mdash; try again.
-          </div>
+          <div style={{ color: "#d9534f", fontSize: 12.5, marginTop: 8 }}>{err}</div>
         )}
-        <button type="submit" style={btn}>Unlock</button>
+        <button type="submit" style={btn} disabled={busy}>{busy ? "Checking…" : "Unlock"}</button>
       </form>
     </div>
   );
