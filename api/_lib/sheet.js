@@ -239,7 +239,11 @@ export async function parseSpreadsheet(bytes, password = "", { yearHint } = {}) 
   const opened = await openWorkbookBytes(bytes, password);
   let wb;
   try {
-    wb = XLSX.read(opened.bytes, { type: "buffer", cellDates: false, cellNF: true, dense: false });
+    // CSV / HTML exports: keep cells as text so "01/09/2026" is read day-first
+    // (Indian banks) by our own date parser, not month-first by SheetJS.
+    const k = sniff(opened.bytes);
+    const textual = k === "text" || k === "html";
+    wb = XLSX.read(opened.bytes, { type: "buffer", cellDates: false, cellNF: true, dense: false, ...(textual ? { raw: true } : {}) });
   } catch (e) {
     if (/password|encrypt/i.test(String(e && e.message))) {
       throw new PasswordError(password ? "That password didn't open the spreadsheet." : "This spreadsheet is password protected — enter its password.");

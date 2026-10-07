@@ -1842,7 +1842,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
 
   const handleSBIFile = onBankFile(sbiOwner, sbiPwd, `ledger:${sbiOwner}Pwd`);
   const handleUBIFile = onBankFile("ubi", ubiPwd, "ledger:ubiPwd", true);
-  const handleBOMFile = onBankFile("bom", bomPwd, "ledger:bomPwd");
+  const handleBOMFile = onBankFile("bom", bomPwd, "ledger:bomPwd", true);
   const handleHDFCBankFile = onBankFile("hdfc_bank", hdfcBankPwd, "ledger:hdfcBankPwd");
   const handleCCFile = onBankFile(ccCardType, ccPwd, `ledger:${ccCardType}Pwd`);
 
@@ -2042,11 +2042,11 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
                 <input
                   type="password"
                   className="sbi-pwd"
-                  placeholder="Statement password"
+                  placeholder="Password (only if the file is locked)"
                   value={bomPwd}
                   onChange={(e) => setBomPwd(e.target.value)}
                 />
-                <label className="sbi-upload-btn" style={!bomPwd.trim() ? {opacity:.45,pointerEvents:"none"} : {}}>
+                <label className="sbi-upload-btn">
                   Upload .pdf
                   <input type="file" accept=".pdf,.PDF" onChange={handleBOMFile} hidden />
                 </label>

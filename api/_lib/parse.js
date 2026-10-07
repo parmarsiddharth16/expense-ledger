@@ -22,7 +22,10 @@
 
 const MONTHS = { jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,sept:9,oct:10,nov:11,dec:12 };
 
-const DATE_RE = /^(\d{1,2})[/\-. ](\d{1,2}|[A-Za-z]{3,4})[/\-. ](\d{2,4})\b/;
+const DATE_RE = /^(\d{1,2})[/\-. ](\d{1,2}|[A-Za-z]{3,4})[/\-. ](\d{4}|\d{2})(?![\d/\-.]\d|\d)/;
+/* A serial-number column before the date (Bank of Maharashtra: "Sr No | Date |
+ * ..."). Without stripping it, "1 01/09/2026" read as 1 Jan 2009. */
+const LEAD_SERIAL_RE = /^\d{1,4}\s+(?=\d{1,2}[/\-. ](?:\d{1,2}|[A-Za-z]{3,4})[/\-. ]\d{2,4})/;
 
 /** "1,24,880.00" | "(1,250.00)" | "742.00Cr" → { value, cr, dr } ; null if not money */
 function money(tok) {
@@ -177,13 +180,19 @@ export function parseStatement(lines, opts = {}) {
   const dated = [];
   for (const line of lines) {
     if (!line.text || NOISE_RE.test(line.text)) continue;
-    const d = parseDate(line.text, yearHint);
+    const serial = (line.text.match(LEAD_SERIAL_RE) || [""])[0];
+    const d = parseDate(line.text.slice(serial.length), yearHint);
     if (!d) continue;
     const toks = moneyTokens(line);
     if (!toks.length) continue;
     // the date itself can tokenise as money on " 04 08 2026" layouts — drop
     // anything sitting inside the matched date span
-    const dateEnd = line.items.length ? line.items[0].x + (d.len / Math.max(1, line.items[0].str.length)) * line.items[0].w : 0;
+    let dateEnd = 0;
+    if (line.items.length) {
+      // find the item holding the date (it may follow a serial-number item)
+      const di = line.items.find((i) => DATE_RE.test(i.str.trim().replace(LEAD_SERIAL_RE, ""))) || line.items[0];
+      dateEnd = di.x + (Math.min(d.len + serial.length, di.str.length) / Math.max(1, di.str.length)) * di.w;
+    }
     dated.push({ line, d, toks: toks.filter((t) => t.right > dateEnd + 1) });
   }
   if (!dated.length) {
@@ -252,7 +261,9 @@ export function parseStatement(lines, opts = {}) {
     // narration = everything left of the money columns, minus the leading date
     const narrationItems = line.items.filter((i) => i.x < firstMoneyX);
     let desc = narrationItems.map((i) => i.str).join(" ").replace(/\s+/g, " ").trim();
-    desc = desc.replace(DATE_RE, "").replace(/^[\s|:-]+/, "").replace(/[\s.|-]+$/, "").trim();
+    desc = desc.replace(LEAD_SERIAL_RE, "").replace(DATE_RE, "").replace(/^[\s|:-]+/, "");
+    desc = desc.replace(DATE_RE, "");  // a value-date column right after the txn date
+    desc = desc.replace(/^[\s|:-]+/, "").replace(/[\s.|-]+$/, "").trim();
 
     let debit = 0, credit = 0, balance = null, amount = null, amountCr = false;
     for (const t of hit.toks) {
