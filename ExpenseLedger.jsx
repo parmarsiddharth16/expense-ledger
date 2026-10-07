@@ -1669,8 +1669,12 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
   const [onlyUnassigned, setOnlyUnassigned] = useState(false);
   const [bulkCat, setBulkCat] = useState("");
   const [err, setErr] = useState("");
-  const [sbiPwd, setSbiPwd] = useState(() => { try { return localStorage.getItem("ledger:sbiPwd") || ""; } catch { return ""; } });
-  const [ccPwd, setCcPwd] = useState(() => { try { return localStorage.getItem("ledger:ccPwd") || ""; } catch { return ""; } });
+  // Each SBI account and each card has its own statement password, remembered
+  // separately (the old single box made SRP reuse Sid's password, and so on).
+  // Falls back to the old shared key so nothing typed before is lost.
+  const loadPwd = (acct, legacyKey) => { try { return localStorage.getItem(`ledger:${acct}Pwd`) || localStorage.getItem(legacyKey) || ""; } catch { return ""; } };
+  const [sbiPwd, setSbiPwd] = useState(() => loadPwd("sbi_srp", "ledger:sbiPwd"));
+  const [ccPwd, setCcPwd] = useState(() => loadPwd("hdfc_regalia", "ledger:ccPwd"));
   const [bomPwd, setBomPwd] = useState(() => { try { return localStorage.getItem("ledger:bomPwd") || ""; } catch { return ""; } });
   const [hdfcBankPwd, setHdfcBankPwd] = useState(() => { try { return localStorage.getItem("ledger:hdfcBankPwd") || ""; } catch { return ""; } });
   const [ubiPwd, setUbiPwd] = useState(() => { try { return localStorage.getItem("ledger:ubiPwd") || ""; } catch { return ""; } });
@@ -1831,15 +1835,16 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
       setErr("Enter the statement password first.");
       return;
     }
-    if (pwdKey && String(pwdValue || "").trim()) { try { localStorage.setItem(pwdKey, pwdValue); } catch {} }
-    await importStatement(f, bank, pwdValue);
+    const pwd = String(pwdValue || "").trim();
+    if (pwdKey && pwd) { try { localStorage.setItem(pwdKey, pwd); } catch {} }
+    await importStatement(f, bank, pwd);
   };
 
-  const handleSBIFile = onBankFile(sbiOwner, sbiPwd, "ledger:sbiPwd");
+  const handleSBIFile = onBankFile(sbiOwner, sbiPwd, `ledger:${sbiOwner}Pwd`);
   const handleUBIFile = onBankFile("ubi", ubiPwd, "ledger:ubiPwd", true);
   const handleBOMFile = onBankFile("bom", bomPwd, "ledger:bomPwd");
   const handleHDFCBankFile = onBankFile("hdfc_bank", hdfcBankPwd, "ledger:hdfcBankPwd");
-  const handleCCFile = onBankFile(ccCardType, ccPwd, "ledger:ccPwd");
+  const handleCCFile = onBankFile(ccCardType, ccPwd, `ledger:${ccCardType}Pwd`);
 
   const headerCells = rows[headerRow] || [];
   const colOpts = headerCells.map((h, i) => ({ i, label: colLabel(i, h) }));
@@ -1989,7 +1994,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
             <div className="sbi-block">
               <div className="sbi-title"><FileSpreadsheet size={15} /> SBI Password-Protected Statement</div>
               <div className="sbi-row" style={{ flexWrap: "wrap", gap: 8 }}>
-                <select className="sbi-pwd" style={{ flex: "0 0 auto", width: "auto" }} value={sbiOwner} onChange={(e) => setSbiOwner(e.target.value)}>
+                <select className="sbi-pwd" style={{ flex: "0 0 auto", width: "auto" }} value={sbiOwner} onChange={(e) => { setSbiOwner(e.target.value); setSbiPwd(loadPwd(e.target.value, "ledger:sbiPwd")); }}>
                   <option value="sbi_srp">SBI SRP</option>
                   <option value="sbi_sid">SBI Sid</option>
                   <option value="sbi_mn">SBI MN</option>
@@ -2012,7 +2017,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
             <div className="sbi-block">
               <div className="sbi-title"><FileSpreadsheet size={15} /> HDFC Credit Card Statement (PDF)</div>
               <div className="sbi-row" style={{ flexWrap: "wrap", gap: 8 }}>
-                <select className="sbi-pwd" style={{ flex: "0 0 auto", width: "auto" }} value={ccCardType} onChange={(e) => setCcCardType(e.target.value)}>
+                <select className="sbi-pwd" style={{ flex: "0 0 auto", width: "auto" }} value={ccCardType} onChange={(e) => { setCcCardType(e.target.value); setCcPwd(loadPwd(e.target.value, "ledger:ccPwd")); }}>
                   <option value="hdfc_regalia">Regalia (SIDD0971)</option>
                   <option value="hdfc_solitaire">Solitaire (SARY5172)</option>
                 </select>

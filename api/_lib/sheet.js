@@ -18,7 +18,7 @@
 import officeCrypto from "officecrypto-tool";
 import XLSX from "xlsx";
 import { parseStatement, checkBalances, _test } from "./parse.js";
-import { PasswordError } from "./pdftext.js";
+import { PasswordError, passwordVariants } from "./pdftext.js";
 
 const { money, parseDate } = _test;
 
@@ -44,15 +44,16 @@ export async function openWorkbookBytes(bytes, password = "") {
   try { encrypted = officeCrypto.isEncrypted(bytes); } catch { encrypted = false; }
   if (!encrypted) return { bytes, encrypted: false };
   if (!password) throw new PasswordError("This spreadsheet is password protected — enter its password.");
-  try {
-    const out = await officeCrypto.decrypt(bytes, { password });
-    return { bytes: Buffer.from(out), encrypted: true };
-  } catch (e) {
-    if (/password/i.test(String(e && e.message))) {
-      throw new PasswordError("That password didn't open the spreadsheet.");
+  for (const pw of passwordVariants(password)) {
+    if (!pw) continue;
+    try {
+      const out = await officeCrypto.decrypt(bytes, { password: pw });
+      return { bytes: Buffer.from(out), encrypted: true };
+    } catch (e) {
+      if (!/password/i.test(String(e && e.message))) throw e;
     }
-    throw e;
   }
+  throw new PasswordError("That password didn't open the spreadsheet.");
 }
 
 /* ---- reading cells ------------------------------------------------------ */

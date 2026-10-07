@@ -32,7 +32,24 @@ export class PasswordError extends Error {
  * @returns {Promise<{pages: number, lines: Line[]}>}
  *   Line = { page, y, text, items: [{ x, w, str }] }
  */
+/** The password as typed, then trimmed, then upper/lower case — banks differ on
+ * case (HDFC uses capitals from the name) and a stray space is easy to type. */
+export function passwordVariants(password) {
+  const p = String(password || "");
+  const t = p.trim();
+  return [...new Set([p, t, t.toUpperCase(), t.toLowerCase()])].filter((v, i) => v || i === 0);
+}
+
 export async function extractLines(bytes, password = "") {
+  let lastErr;
+  for (const pw of passwordVariants(password)) {
+    try { return await extractLinesOnce(bytes, pw); }
+    catch (e) { lastErr = e; if (!(e instanceof PasswordError) || !password) throw e; }
+  }
+  throw lastErr;
+}
+
+async function extractLinesOnce(bytes, password = "") {
   let doc;
   try {
     doc = await pdfjs.getDocument({
