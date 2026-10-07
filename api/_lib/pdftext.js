@@ -14,6 +14,13 @@
 // legacy build: no DOM, no worker, runs in plain Node. Imported statically so
 // Vercel's dependency tracing bundles it into the function.
 import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
+// pdf.js runs its "worker" in-process on Node, loading it with a dynamic
+// import() that Vercel's file tracing can't see — so the worker file was left
+// out of the deployed function and every PDF failed with "Setting up fake
+// worker failed". Importing it statically gets it bundled, and pdf.js uses a
+// handler already on globalThis instead of importing it again.
+import * as pdfjsWorker from "pdfjs-dist/legacy/build/pdf.worker.mjs";
+globalThis.pdfjsWorker = pdfjsWorker;
 
 export class PasswordError extends Error {
   constructor(msg) { super(msg); this.name = "PasswordError"; this.code = "BAD_PASSWORD"; }
