@@ -67,15 +67,31 @@ function moneyTokens(line) {
     const whole = it.str.trim();
     const parts = whole.split(/\s+/);
     if (parts.length === 1) {
+      if (/^(cr|dr)\.?$/i.test(whole) && out.length) {
+        // a lone "Cr"/"Dr" item: mark the number just before it
+        const prev = out[out.length - 1];
+        if (it.x - prev.right < 25) { if (/^cr/i.test(whole)) prev.cr = true; else prev.dr = true; }
+        continue;
+      }
       const m = money(whole);
       if (m) out.push({ ...m, x: it.x, right: it.x + it.w, str: whole });
       continue;
     }
     const per = it.w / Math.max(1, whole.length);
     let off = 0;
-    for (const p of parts) {
+    for (let k = 0; k < parts.length; k++) {
+      const p = parts[k];
       const m = money(p);
-      if (m) out.push({ ...m, x: it.x + off * per, right: it.x + (off + p.length) * per, str: p });
+      if (m) {
+        const tok = { ...m, x: it.x + off * per, right: it.x + (off + p.length) * per, str: p };
+        // "25,000.00 Cr" — the marker is its own word but belongs to the number
+        const nxt = parts[k + 1];
+        if (nxt && /^(cr|dr)\.?$/i.test(nxt)) {
+          if (/^cr/i.test(nxt)) tok.cr = true; else tok.dr = true;
+          tok.right = it.x + (off + p.length + 1 + nxt.length) * per;
+        }
+        out.push(tok);
+      }
       off += p.length + 1;
     }
   }
@@ -180,7 +196,11 @@ export function parseStatement(lines, opts = {}) {
   const hRoles = header ? header.roles.filter((r) => r.role !== "amount" || header.roles.length === 1) : [];
 
   let names;
-  if (hRoles.length && hRoles.length === cols.length) {
+  if (cols.length === 1) {
+    // One money column (credit-card statements). Never let a stray header word
+    // like the "Credit" in "Credit Limit" turn every spend into a credit.
+    names = ["amount"];
+  } else if (hRoles.length && hRoles.length === cols.length) {
     // same number of money headers as money columns → zip in reading order.
     names = hRoles.map((r) => r.role);
   } else if (cols.length === 3) {
