@@ -3,10 +3,11 @@ import { parseStatement } from "./_lib/parse.js";
 import { requirePasscode } from "./_lib/auth.js";
 import { readJsonBody } from "./_lib/blob.js";
 import { askClaude } from "./_lib/ai.js";
+import { sniff, isSheetKind, parseSpreadsheet, rowsToCSV } from "./_lib/sheet.js";
 
 /*
  * POST /api/extract
- *   { file: <base64 pdf>, password?: string, bank?: string, filename?: string }
+ *   { file: <base64 pdf | xlsx | xls | csv>, password?: string, bank?: string, filename?: string }
  * ->{ ok, transactions: [{date, description, amount, kind}], diagnostics }
  *
  * Replaces the /api/decrypt endpoint the app calls but which was never
@@ -62,16 +63,21 @@ export default async function handler(req, res) {
     const bytes = Buffer.from(b64, "base64");
     if (!bytes.length) { res.status(400).json({ ok: false, error: "That file didn't decode." }); return; }
     if (bytes.length > MAX_BYTES) {
-      res.status(413).json({ ok: false, error: `That PDF is ${(bytes.length/1048576).toFixed(1)} MB — too large to process. Split it or export a CSV.` });
+      res.status(413).json({ ok: false, error: `That file is ${(bytes.length/1048576).toFixed(1)} MB — too large to process. Split it or export a CSV.` });
       return;
     }
-    if (bytes.slice(0, 5).toString("latin1") !== "%PDF-") {
-      res.status(400).json({ ok: false, error: "That doesn't look like a PDF." });
-      return;
-    }
-
+    const kind = sniff(bytes);
     const password = String(body.password || "");
     const yearHint = Number(body.yearHint) || new Date().getFullYear();
+
+    if (isSheetKind(kind)) {
+      await handleSpreadsheet(res, bytes, password, yearHint, t0, kind);
+      return;
+    }
+    if (kind !== "pdf") {
+      res.status(400).json({ ok: false, error: "That file isn't a PDF or an Excel/CSV statement." });
+      return;
+    }
 
     let lines = [], pages = 0;
     try {
@@ -143,4 +149,71 @@ export default async function handler(req, res) {
   } catch (e) {
     res.status(500).json({ ok: false, error: String((e && e.message) || e) });
   }
+}
+
+/* Excel / CSV statements: decrypt if locked, read the grid, name the columns.
+ * Same response shape as the PDF path, so the app treats both identically. */
+async function handleSpreadsheet(res, bytes, password, yearHint, t0, kind) {
+  let parsed;
+  try {
+    parsed = await parseSpreadsheet(bytes, password, { yearHint });
+  } catch (e) {
+    if (e instanceof PasswordError || e.code === "BAD_PASSWORD") {
+      res.status(400).json({ ok: false, error: e.message, needsPassword: true });
+      return;
+    }
+    throw e;
+  }
+
+  let transactions = parsed.transactions.map((t) => ({
+    date: t.date,
+    description: t.description,
+    amount: t.debit || t.credit,
+    kind: t.debit ? "debit" : "credit",
+    balance: t.balance,
+  })).filter((t) => t.amount > 0);
+
+  let source = "spreadsheet";
+  let aiError = null;
+  if (!transactions.length && parsed.rows.length) {
+    try {
+      const csv = rowsToCSV(parsed.rows).slice(0, 150000);
+      const text = await askClaude({
+        maxTokens: 8000,
+        content: [{ type: "text", text: AI_PROMPT + "\n\nThe statement, as CSV:\n\n" + csv }],
+      });
+      transactions = salvageJSON(text)
+        .filter((t) => t && Number(t.amount) > 0 && t.date)
+        .map((t) => ({
+          date: String(t.date).slice(0, 10),
+          description: String(t.description || "").trim(),
+          amount: Math.abs(Number(t.amount)),
+          kind: t.kind === "credit" ? "credit" : "debit",
+          balance: null,
+        }));
+      source = "claude";
+    } catch (e) {
+      aiError = String(e.message || e);
+      source = "spreadsheet-empty";
+    }
+  }
+
+  res.status(200).json({
+    ok: true,
+    transactions,
+    diagnostics: {
+      source,
+      format: kind,
+      encrypted: parsed.encrypted,
+      sheet: parsed.sheet,
+      rows: parsed.rows.length,
+      columns: parsed.columns,
+      usedHeader: parsed.usedHeader,
+      balanceCheck: parsed.balanceCheck,
+      debits: transactions.filter((t) => t.kind === "debit").length,
+      credits: transactions.filter((t) => t.kind === "credit").length,
+      ms: Date.now() - t0,
+      aiError,
+    },
+  });
 }

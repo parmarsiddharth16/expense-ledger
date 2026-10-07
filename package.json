@@ -12,6 +12,7 @@
     "@babel/runtime": "^7.26.0",
     "@vercel/blob": "^2.6.1",
     "lucide-react": "^0.383.0",
+    "officecrypto-tool": "^0.0.19",
     "papaparse": "^5.4.1",
     "pdfjs-dist": "^4.10.38",
     "react": "^18.3.1",

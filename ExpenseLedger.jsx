@@ -1632,6 +1632,8 @@ function CatSelect({ categories, value, onChange, hint }) {
   );
 }
 
+/* OLE compound file (D0 CF 11 E0): a legacy .xls, or an encrypted .xlsx wrapper. */
+const isOleFile = (buf) => { const b = new Uint8Array(buf, 0, Math.min(8, buf.byteLength)); return b[0] === 0xd0 && b[1] === 0xcf && b[2] === 0x11 && b[3] === 0xe0; };
 const fileToB64 = (f) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.onerror = () => rej(r.error); r.readAsDataURL(f); });
 function salvageJSON(text) {
   if (!text) return [];
@@ -1671,6 +1673,8 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
   const [ccPwd, setCcPwd] = useState(() => { try { return localStorage.getItem("ledger:ccPwd") || ""; } catch { return ""; } });
   const [bomPwd, setBomPwd] = useState(() => { try { return localStorage.getItem("ledger:bomPwd") || ""; } catch { return ""; } });
   const [hdfcBankPwd, setHdfcBankPwd] = useState(() => { try { return localStorage.getItem("ledger:hdfcBankPwd") || ""; } catch { return ""; } });
+  const [ubiPwd, setUbiPwd] = useState(() => { try { return localStorage.getItem("ledger:ubiPwd") || ""; } catch { return ""; } });
+  const [genericPwd, setGenericPwd] = useState(""); // one-off, never saved
   const [ccCardType, setCcCardType] = useState("hdfc_regalia");
   const [sbiOwner, setSbiOwner] = useState("sbi_srp");
   const [genericBank, setGenericBank] = useState("");
@@ -1722,13 +1726,28 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
         await importStatement(f, genericBank, "");
         return;
       }
+      // A password was given: the server decrypts and reads the file (Excel or PDF).
+      if (genericPwd.trim()) {
+        await importStatement(f, genericBank, genericPwd.trim());
+        return;
+      }
       let parsed = [];
       if (nm.endsWith(".csv") || nm.endsWith(".txt")) {
         const text = await f.text();
         parsed = Papa.parse(text, { skipEmptyLines: "greedy" }).data;
       } else {
         const buf = await f.arrayBuffer();
-        const wb = XLSX.read(buf, { type: "array" });
+        let wb;
+        try { wb = XLSX.read(buf, { type: "array" }); }
+        catch (xe) {
+          // SheetJS can't open an encrypted workbook — ask for the password.
+          if (/password|encrypt|ecma-376|cfb/i.test(String(xe && xe.message)) || isOleFile(buf)) {
+            setErr("This spreadsheet is password protected — type its password in the box above, then choose the file again.");
+            setStep("upload");
+            return;
+          }
+          throw xe;
+        }
         const ws = wb.Sheets[wb.SheetNames[0]];
         parsed = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
       }
@@ -1804,20 +1823,20 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
     }
   };
 
-  const onBankFile = (bank, pwdValue, pwdKey) => async (e) => {
+  const onBankFile = (bank, pwdValue, pwdKey, optional = false) => async (e) => {
     const f = e.target.files?.[0]; if (!f) return;
     e.target.value = "";
-    const needsPwd = pwdKey !== null;
+    const needsPwd = pwdKey !== null && !optional;
     if (needsPwd && !String(pwdValue || "").trim()) {
       setErr("Enter the statement password first.");
       return;
     }
-    if (pwdKey) { try { localStorage.setItem(pwdKey, pwdValue); } catch {} }
+    if (pwdKey && String(pwdValue || "").trim()) { try { localStorage.setItem(pwdKey, pwdValue); } catch {} }
     await importStatement(f, bank, pwdValue);
   };
 
   const handleSBIFile = onBankFile(sbiOwner, sbiPwd, "ledger:sbiPwd");
-  const handleUBIFile = onBankFile("ubi", "", null);
+  const handleUBIFile = onBankFile("ubi", ubiPwd, "ledger:ubiPwd", true);
   const handleBOMFile = onBankFile("bom", bomPwd, "ledger:bomPwd");
   const handleHDFCBankFile = onBankFile("hdfc_bank", hdfcBankPwd, "ledger:hdfcBankPwd");
   const handleCCFile = onBankFile(ccCardType, ccPwd, "ledger:ccPwd");
@@ -1946,10 +1965,20 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
                 <BankOptions list={STMT_BANKS} />
               </select>
             </div>
+            <div className="sbi-row" style={{ flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+              <span className="person-label" style={{ fontWeight: 600 }}>File password:</span>
+              <input
+                type="password"
+                className="sbi-pwd"
+                placeholder="Only if the file is locked"
+                value={genericPwd}
+                onChange={(e) => setGenericPwd(e.target.value)}
+              />
+            </div>
             <label className="dropzone" style={!genericBank ? { opacity: .45, pointerEvents: "none" } : {}}>
               <FileSpreadsheet size={26} strokeWidth={1.6} />
               <span className="dz-title">Choose a CSV, Excel or PDF file</span>
-              <span className="dz-sub">CSV &amp; Excel are read on your device. PDFs (and photos of statements) are read by Claude's API.</span>
+              <span className="dz-sub">Password-protected PDF and Excel files are unlocked and read for you — no need to convert to CSV first.</span>
               <input type="file" accept=".csv,.xls,.xlsx,.txt,.pdf,.png,.jpg,.jpeg,.webp" onChange={handleFile} hidden />
               <span className="dz-btn">Browse files</span>
             </label>
@@ -1973,11 +2002,11 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
                   onChange={(e) => setSbiPwd(e.target.value)}
                 />
                 <label className="sbi-upload-btn" style={!sbiPwd.trim() ? {opacity:.45,pointerEvents:"none"} : {}}>
-                  Upload .xlsx
-                  <input type="file" accept=".xlsx" onChange={handleSBIFile} hidden />
+                  Upload file
+                  <input type="file" accept=".xlsx,.xls,.pdf" onChange={handleSBIFile} hidden />
                 </label>
               </div>
-              <div className="imp-note"><Info size={14} /> Select whose account, then enter password. Each import marks that SBI account as done for the month.</div>
+              <div className="imp-note"><Info size={14} /> Select whose account, enter the password, then upload the locked Excel (.xlsx/.xls) or PDF as downloaded — no conversion needed. Each import marks that SBI account as done for the month.</div>
             </div>
             <div className="imp-divider">or</div>
             <div className="sbi-block">
@@ -2021,12 +2050,18 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
             </div>
             <div className="imp-divider">or</div>
             <div className="sbi-block">
-              <div className="sbi-title"><FileSpreadsheet size={15} /> Union Bank of India Statement (Excel)</div>
+              <div className="sbi-title"><FileSpreadsheet size={15} /> Union Bank of India Statement (Excel or PDF)</div>
               <div className="sbi-row">
-                <span style={{flex:1, fontSize:12, color:"var(--faint)"}}>No password needed — download the .xlsx from UBI NetBanking and upload directly.</span>
+                <input
+                  type="password"
+                  className="sbi-pwd"
+                  placeholder="Password (if the file is locked)"
+                  value={ubiPwd}
+                  onChange={(e) => setUbiPwd(e.target.value)}
+                />
                 <label className="sbi-upload-btn">
                   Upload .xlsx
-                  <input type="file" accept=".xlsx,.xls" onChange={handleUBIFile} hidden />
+                  <input type="file" accept=".xlsx,.xls,.pdf" onChange={handleUBIFile} hidden />
                 </label>
               </div>
               <div className="imp-note"><Info size={14} /> Only withdrawals are imported. UBI statements include your own category labels — these appear as descriptions.</div>
