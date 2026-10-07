@@ -63,6 +63,11 @@ function parseDate(str, yearHint) {
 
 /* ---- tokenising --------------------------------------------------------- */
 
+/** A bare integer of 6+ digits with no decimals and no grouping commas. */
+function isReference(t) {
+  return !t.decimals && !/,/.test(t.str) && String(t.str).replace(/\D/g, "").length >= 6;
+}
+
 /** Every money token on a line, each with its own x span. */
 function moneyTokens(line) {
   const out = [];
@@ -183,7 +188,10 @@ export function parseStatement(lines, opts = {}) {
     const serial = (line.text.match(LEAD_SERIAL_RE) || [""])[0];
     const d = parseDate(line.text.slice(serial.length), yearHint);
     if (!d) continue;
-    const toks = moneyTokens(line);
+    // Long bare integers are reference / cheque numbers, not money: BoM has a
+    // "Cheque/Reference No" column of 12-digit UPI refs on every row, which
+    // otherwise clusters into a "money" column and shows up as ₹1,05,63,49,15,950.
+    const toks = moneyTokens(line).filter((t) => !isReference(t));
     if (!toks.length) continue;
     // the date itself can tokenise as money on " 04 08 2026" layouts — drop
     // anything sitting inside the matched date span
@@ -243,24 +251,19 @@ export function parseStatement(lines, opts = {}) {
   const moneyLefts = dated.flatMap((r) => r.toks.filter((t) => colFor(t)).map((t) => t.x));
   const firstMoneyX = moneyLefts.length ? Math.min(...moneyLefts) - 2 : Infinity;
 
-  // pass 3 — build rows
+  // pass 3 — build rows from the dated lines
+  const cleanNarration = (items) => items
+    .filter((i) => !/^\d{9,}$/.test(i.str.trim()))      // reference-number column
+    .map((i) => i.str).join(" ").replace(/\s+/g, " ").trim();
   const rows = [];
-  let last = null;
-  for (const line of lines) {
-    if (!line.text || NOISE_RE.test(line.text)) { last = null; continue; }
+  const datedIdx = new Map();
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li];
     const hit = dated.find((r) => r.line === line);
-    if (!hit) {
-      // wrapped narration: text sitting left of the money columns, no date
-      if (last && line.items.length && Math.max(...line.items.map((i) => i.x + i.w)) < firstMoneyX) {
-        const extra = line.text.trim();
-        if (extra && extra.length < 90) last.description += " " + extra;
-      }
-      continue;
-    }
+    if (!hit) continue;
 
-    // narration = everything left of the money columns, minus the leading date
-    const narrationItems = line.items.filter((i) => i.x < firstMoneyX);
-    let desc = narrationItems.map((i) => i.str).join(" ").replace(/\s+/g, " ").trim();
+    // narration = everything left of the money columns, minus serial and dates
+    let desc = cleanNarration(line.items.filter((i) => i.x < firstMoneyX));
     desc = desc.replace(LEAD_SERIAL_RE, "").replace(DATE_RE, "").replace(/^[\s|:-]+/, "");
     desc = desc.replace(DATE_RE, "");  // a value-date column right after the txn date
     desc = desc.replace(/^[\s|:-]+/, "").replace(/[\s.|-]+$/, "").trim();
@@ -275,19 +278,63 @@ export function parseStatement(lines, opts = {}) {
       else if (role === "amount") { amount = t.value; amountCr = t.cr; }
       if (t.cr) amountCr = true;
     }
+    if (!debit && !credit && amount === null) continue;
 
-    if (amount !== null && !debit && !credit) {
-      if (amountCr || CREDIT_HINT.test(desc)) credit = amount; else debit = amount;
+    const row = { date: hit.d.iso, description: desc, above: [], below: [], debit, credit, balance,
+                  amount, amountCr, page: line.page, y: line.y, raw: line.text };
+    rows.push(row);
+    datedIdx.set(li, row);
+  }
+
+  // pass 4 — wrapped narration. Statements wrap a long narration onto lines
+  // above AND below the line carrying the date and amounts (BoM centres it
+  // vertically), so each loose text line goes to the NEAREST row on its page,
+  // not simply the one before it.
+  const gaps = [];
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i].page === rows[i - 1].page) gaps.push(Math.abs(rows[i].y - rows[i - 1].y));
+  }
+  gaps.sort((a, b) => a - b);
+  const medianGap = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 30;
+  const maxDist = Math.max(8, medianGap * 0.75);
+  const firstRowIdx = Math.min(...datedIdx.keys());
+  let sinceRow = 0;   // lines since the last dated row, to stop at footers
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li];
+    if (datedIdx.has(li)) { sinceRow = 0; continue; }
+    sinceRow++;
+    if (!line.text || NOISE_RE.test(line.text) || !line.items.length) continue;
+    if (li < firstRowIdx - 2) continue;                 // header area
+    if (Math.max(...line.items.map((i) => i.x + i.w)) >= firstMoneyX) continue;  // not narration
+    const extra = cleanNarration(line.items);
+    if (!extra || extra.length >= 90) continue;
+    let best = null, bd = Infinity;
+    for (const r of rows) {
+      if (r.page !== line.page) continue;
+      const d = Math.abs(r.y - line.y);
+      // ties go to the row above, the classic "continues on the next line"
+      if (d < bd || (d === bd && best && r.y > best.y)) { bd = d; best = r; }
+    }
+    if (!best || bd > maxDist || (li > firstRowIdx && sinceRow > 4)) continue;
+    // top of page is the larger y for PDFs; synthetic sheet lines use -index
+    (line.y > best.y ? best.above : best.below).push({ y: line.y, text: extra });
+  }
+
+  for (const r of rows) {
+    const above = r.above.sort((a, b) => b.y - a.y).map((p) => p.text);
+    const below = r.below.sort((a, b) => b.y - a.y).map((p) => p.text);
+    r.description = [...above, r.description, ...below].filter(Boolean).join(" ")
+      .replace(/(^|\s)\d{1,2}[/-]\d{1,2}[/-]\d{2,4}(?=\s|$)/g, " ")   // stray value-date column
+      .replace(/\s+/g, " ").trim();
+    if (r.amount !== null && !r.debit && !r.credit) {
+      if (r.amountCr || CREDIT_HINT.test(r.description)) r.credit = r.amount; else r.debit = r.amount;
     }
     // an explicit Cr marker always wins over column placement
-    if (debit && amountCr) { credit = debit; debit = 0; }
-
-    if (!debit && !credit) { last = null; continue; }
-
-    const row = { date: hit.d.iso, description: desc, debit, credit, balance, page: line.page, raw: line.text };
-    rows.push(row);
-    last = row;
+    if (r.debit && r.amountCr) { r.credit = r.debit; r.debit = 0; }
+    delete r.above; delete r.below; delete r.amount; delete r.amountCr; delete r.y;
   }
+  const kept = rows.filter((r) => r.debit || r.credit);
+  rows.length = 0; rows.push(...kept);
 
   return {
     transactions: rows,
