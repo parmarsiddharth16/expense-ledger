@@ -50,11 +50,6 @@ const SECTIONS = [
  * but left out of Spent, budget use, savings and the over-budget alerts. */
 const NONSPEND_SECTION = "Claims & Transfers";
 const NONSPEND_SEED = ["Claim", "Internal TRF"];
-/* Categories that require a person tag when logging */
-const PERSON_CATS = new Set([
-  "Medical", "Mobile", "Holiday", "Food & Travel",
-  "Entertainment", "Shopping", "Parlour",
-]);
 /* Old category names → new names (for data migration on reseed) */
 const LEGACY_NAMES = {
   // v2→v3
@@ -410,7 +405,6 @@ export default function ExpenseLedger() {
   };
 
   const saveCats = useCallback((n) => { setCategories(n); store.set(K_CATS, n); }, []);
-  const saveInc = useCallback((n) => { setIncome(n); store.set(K_INC, n); }, []);
   const saveExps = useCallback((n) => { setExpenses(n); store.set(K_EXP, n); }, []);
   const saveSym = useCallback((s) => { setSym(s); store.set(K_SET, { sym: s }); }, []);
   const saveStmts = useCallback((n) => { setStmts(n); store.set(K_STMTS, n); }, []);
@@ -475,7 +469,6 @@ export default function ExpenseLedger() {
   const usedPct = totalBudget > 0 ? (totalSpent / totalBudget) * 100 : 0;
   const net = totalIncome - totalSpent;
   const savingsRate = totalIncome > 0 ? (net / totalIncome) * 100 : 0;
-  const plannedNet = totalIncome - totalBudget;
 
   const overRows = rows.filter((r) => r.status === "over" || r.status === "unbudgeted");
   const hiddenCount = hideEmpty
@@ -633,10 +626,6 @@ export default function ExpenseLedger() {
     }));
   };
   const editCatName = (id, name) => saveCats(categories.map((c) => (c.id === id ? { ...c, name } : c)));
-  const editIncome = (id, value) => {
-    const v = parseFloat(value) || 0;
-    saveInc(income.map((l) => (l.id === id ? { ...l, monthly: flat(v) } : l)));
-  };
   const addCategory = () =>
     saveCats([...categories, { id: uid(), name: "New category", section: "Lifestyle", recurring: true, monthly: flat(0) }]);
   const delCategory = (id) => {
@@ -1635,22 +1624,6 @@ function CatSelect({ categories, value, onChange, hint }) {
 /* OLE compound file (D0 CF 11 E0): a legacy .xls, or an encrypted .xlsx wrapper. */
 const isOleFile = (buf) => { const b = new Uint8Array(buf, 0, Math.min(8, buf.byteLength)); return b[0] === 0xd0 && b[1] === 0xcf && b[2] === 0x11 && b[3] === 0xe0; };
 const fileToB64 = (f) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.onerror = () => rej(r.error); r.readAsDataURL(f); });
-function salvageJSON(text) {
-  if (!text) return [];
-  let s = text.replace(/```json/gi, "").replace(/```/g, "").trim();
-  const i = s.indexOf("["); if (i < 0) return [];
-  s = s.slice(i);
-  try { return JSON.parse(s); } catch {}
-  const last = s.lastIndexOf("}");
-  if (last > 0) { try { return JSON.parse(s.slice(0, last + 1) + "]"); } catch {} }
-  return [];
-}
-const toISODate = (d) => { const s = String(d || "").trim(); if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s; return parseDate(s, "DMY") || ""; };
-/* extractViaAPI used to live here. It POSTed the statement straight to
- * api.anthropic.com from the browser with no API key attached, so it always
- * failed — and had a key been added it would have been readable by anyone who
- * opened the page. Extraction is now a server call: see /api/extract. */
-
 function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImport }) {
   const [step, setStep] = useState("upload");
   const [viaAPI, setViaAPI] = useState(false);
@@ -1691,7 +1664,6 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
   const [autoBy, setAutoBy] = useState({});      // key -> {layer, confidence, reason, candidates}
   const dupKey = (date, amount, desc) => `${date}|${Math.round(amount)}|${normMerchant(desc)}`;
   const existingKeys = useMemo(() => new Set((existing || []).map((e) => dupKey(e.date, e.amount, e.note))), [existing]);
-  const catById = useMemo(() => Object.fromEntries((categories || []).map((c) => [c.id, c])), [categories]);
 
   const toReview = (out, fromAPI) => {
     if (!out.length) { setErr("No expense transactions were found. For tabular files, check the column mapping; for PDFs, try a clearer copy or a CSV/Excel export."); if (fromAPI) setStep("upload"); return; }
@@ -1871,8 +1843,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
     if (onlyUnassigned && assign[t.key]) return false;
     return true;
   });
-  const assignedCount = txns.filter((t) => include[t.key] && assign[t.key]).length;
-  const importTotal = txns.filter((t) => include[t.key] && assign[t.key]).reduce((s, t) => s + t.amount, 0);
+  const selectedTotal = txns.filter((t) => include[t.key]).reduce((s, t) => s + t.amount, 0);
   const dupCount = txns.filter((t) => dup[t.key]).length;
 
   const applyBulk = () => {
@@ -2098,7 +2069,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
             <div className="loadbox">
               <span className="spin" />
               <span className="dz-title">Reading {fileName}…</span>
-              <span className="dz-sub">Extracting transactions from your statement. This can take a few moments.</span>
+              <span className="dz-sub">{progress || "Extracting transactions from your statement. This can take a few moments."}</span>
             </div>
           </div>
         )}
@@ -2168,7 +2139,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
           return (
           <div className="imp-body">
             <div className="rev-summary">
-              <strong>{txns.length}</strong> found · <strong>{includedCount}</strong> selected
+              <strong>{txns.length}</strong> found · <strong>{includedCount}</strong> selected ({money(selectedTotal, sym)})
               {autoCount > 0 && <span style={{color:"var(--teal)"}}> · <strong>{autoCount}</strong> categorised automatically</span>}
               {uncatCount > 0 && <span className="rev-uncat"> · <strong>{uncatCount}</strong> → Suspense</span>}
               {dupCount > 0 && <span className="rev-dupnote"> · {dupCount} look already imported (unticked)</span>}
