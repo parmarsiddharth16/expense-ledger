@@ -1716,7 +1716,8 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
 
   const handleFile = async (e) => {
     const f = e.target.files?.[0]; if (!f) return;
-    if (!genericBank) { e.target.value = ""; setErr("Pick which bank / card this file is from first."); return; }
+    e.target.value = "";  // so choosing the same file again (e.g. after typing a password) still fires
+    if (!genericBank) { setErr("Pick which bank / card this file is from first."); return; }
     setErr(""); setFileName(f.name);
     setBankSource(genericBank);
     const nm = f.name.toLowerCase();
@@ -1727,7 +1728,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
           setErr("Images aren't supported — upload the PDF statement itself, or a CSV/Excel export.");
           return;
         }
-        await importStatement(f, genericBank, "");
+        await importStatement(f, genericBank, genericPwd.trim());
         return;
       }
       // A password was given: the server decrypts and reads the file (Excel or PDF).
