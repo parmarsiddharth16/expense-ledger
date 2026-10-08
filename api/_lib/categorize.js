@@ -56,7 +56,7 @@ function stripCity(t) {
 
 /** The meaningful tokens of a narration — the payee, stripped of rail noise,
  *  reference numbers, bank codes and trailing city names. */
-export function merchantTokens(desc) {
+function merchantTokens(desc) {
   const flat = (desc || "").toUpperCase()
     .split(/[/|\s]/).map((seg) => seg.split("@")[0]).join(" ");
   return [...new Set(
@@ -69,13 +69,8 @@ export function merchantTokens(desc) {
 }
 
 /** Stable identity for a merchant. */
-export function merchantKey(desc) {
+function merchantKey(desc) {
   return merchantTokens(desc).slice(0, 3).join(" ");
-}
-
-/** The app's original key — kept only to read legacy merchantMap entries. */
-export function legacyKey(desc) {
-  return (desc || "").toUpperCase().replace(/[^A-Z ]/g, " ").split(/\s+/).filter((w) => w.length > 2).slice(0, 3).join(" ");
 }
 
 /* ---- index -------------------------------------------------------------- */
@@ -284,4 +279,3 @@ export function neighbours(txn, ix, n = 12) {
   }).slice(0, n);
 }
 
-export const PARAMS_DEFAULT = PARAMS;

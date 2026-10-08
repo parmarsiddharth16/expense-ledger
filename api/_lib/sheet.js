@@ -39,7 +39,7 @@ export function isSheetKind(kind) {
 }
 
 /** Decrypt if needed. Throws PasswordError on a missing or wrong password. */
-export async function openWorkbookBytes(bytes, password = "") {
+async function openWorkbookBytes(bytes, password = "") {
   let encrypted = false;
   try { encrypted = officeCrypto.isEncrypted(bytes); } catch { encrypted = false; }
   if (!encrypted) return { bytes, encrypted: false };
