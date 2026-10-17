@@ -40,7 +40,20 @@ function presented(req) {
  * returns false — callers must stop.
  */
 export function requirePasscode(req, res) {
-  if (!isProtected()) return true;
+  if (!isProtected()) {
+    // On Vercel, a missing passcode is a misconfiguration, not an invitation:
+    // fail closed so the ledger is never served to anyone who finds the URL.
+    // (Only a local dev server, with no VERCEL_ENV, stays open.)
+    if (process.env.VERCEL_ENV) {
+      res.status(503).json({
+        ok: false,
+        locked: true,
+        error: "The ledger is locked: LEDGER_PASSCODE isn't set for this deployment in Vercel. Set it, then redeploy.",
+      });
+      return false;
+    }
+    return true;
+  }
   const given = presented(req);
   if (given && safeEqual(given, process.env.LEDGER_PASSCODE)) return true;
   res.status(401).json({

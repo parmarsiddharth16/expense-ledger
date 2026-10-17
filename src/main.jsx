@@ -60,7 +60,8 @@ function Gate() {
         setOk(true); setVal(""); setMsg(""); setBusy(false); return;
       }
       auth.set("");
-      setErr(res.status === 401 ? "Incorrect code — try again." : "Couldn't reach the ledger. Try again.");
+      const j = await res.json().catch(() => ({}));
+      setErr(res.status === 401 ? "Incorrect code — try again." : j.locked ? j.error : "Couldn't reach the ledger. Try again.");
     } catch {
       auth.set("");
       setErr("Couldn't reach the ledger. Check your connection.");
