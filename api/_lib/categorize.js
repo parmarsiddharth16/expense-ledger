@@ -69,7 +69,7 @@ function merchantTokens(desc) {
 }
 
 /** Stable identity for a merchant. */
-function merchantKey(desc) {
+export function merchantKey(desc) {
   return merchantTokens(desc).slice(0, 3).join(" ");
 }
 

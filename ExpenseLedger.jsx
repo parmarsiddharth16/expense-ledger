@@ -2,13 +2,27 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
 import {
   ChevronLeft, ChevronRight, Plus, Trash2, SlidersHorizontal, X,
   TriangleAlert, Check, Wallet, ArrowUpRight, Sparkles, Eye, EyeOff,
-  Upload, FileSpreadsheet, ArrowRight, Search, Info, BarChart2, Pencil, Download
+  Upload, FileSpreadsheet, ArrowRight, Search, Info, BarChart2, Pencil, Download, LogOut, Scissors, Tag
 } from "lucide-react";
 import {
   ComposedChart, BarChart, Bar, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, Legend
 } from "recharts";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
+import { merchantKey } from "./api/_lib/categorize.js";
+import { periodOf, currentPeriod, setMonthStart, getMonthStart, periodLabel } from "./src/period.js";
+import {
+  useMonthFigures, KpiStrip, PaceCard, BillsCard, BudgetsCard, StructureCard,
+  CashFlowCard, PayeesCard, SetAsideCard, QuickAdd, HistoryView, dashCss,
+} from "./src/dashboard.jsx";
+import {
+  classifyCredit, creditDupKey, MoneyInReview, IncomeView, incomeCss, monthIncome, dueDayOf, isBillCat, CREDIT_KINDS, ordinal, guessRefundCat,
+} from "./src/income.jsx";
+import {
+  DrillDown, computeAlerts, AlertsStrip, BalancesCard, GoalsCard, TagsView, SplitModal, CalendarView, AskView, featuresCss, parseTags,
+} from "./src/features.jsx";
+
+export const APP_VERSION = "2.2.0";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -30,7 +44,7 @@ const monthLabel = (k, o = { month: "long", year: "numeric" }) => {
   const [y, m] = k.split("-").map(Number);
   return new Date(y, m - 1, 1).toLocaleDateString("en-US", o);
 };
-const todayISO = () => new Date().toISOString().slice(0, 10);
+const todayISO = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
 
 const FY_START = "2026-04", FY_END = "2027-03";
 
@@ -133,26 +147,39 @@ const buildIncome = () => [
 
 /* -------------------------------------------------------------------------
  * Cloud-backed store.
- * Data now lives in a single JSON blob on the server (/api/data, Vercel Blob)
- * so it persists across devices, browsers, and deployments. localStorage is
- * kept as an offline cache / fallback: if the network or the blob store is
- * unavailable, the app still works exactly as it did before (device-local).
- * Bank-statement passwords (ledger:*Pwd) are deliberately NOT synced — they
- * stay on the device only.
+ * Data lives in a single JSON blob on the server (/api/data, Vercel Blob) so it
+ * persists across devices, browsers, and deployments. It is held in memory
+ * only while the app is unlocked — nothing from the ledger is cached in this
+ * browser any more, so a device that hasn't entered the passcode this visit
+ * has nothing to show. Bank-statement passwords (ledger:*Pwd) are the one
+ * exception: they stay in this browser only and are never synced.
  * ---------------------------------------------------------------------- */
 const SENSITIVE = /Pwd$/; // password keys never leave the device
 
-/* The ledger passcode. Held in this tab only, mirrored to localStorage so a
- * reload doesn't ask again, and sent as a header on every API call. It is not
- * part of the synced payload — SENSITIVE keeps *Pwd keys local, and this never
- * enters the cache at all. */
+/* Older versions cached the whole ledger (and the passcode) in localStorage.
+ * Clear that out on first load so it doesn't linger on shared devices. */
+const KEEP_LOCAL = /Pwd$|^ledger:(lastBank|catPersonMap)$/;
+function purgeLocalCache() {
+  try {
+    const drop = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("ledger:") && (!KEEP_LOCAL.test(k) || k === "ledger:passPwd")) drop.push(k);
+    }
+    drop.forEach((k) => localStorage.removeItem(k));
+    sessionStorage.removeItem("ledger:gate");
+  } catch {}
+}
+purgeLocalCache();
+
+/* The ledger passcode. Held in memory only — never written to localStorage,
+ * sessionStorage or a cookie — so every new visit, tab or reload asks for it
+ * again, and logging out (or closing the tab) leaves nothing behind that opens
+ * the ledger. Sent as a header on every API call. */
 export const auth = {
-  pass: (() => { try { return localStorage.getItem("ledger:passPwd") || ""; } catch { return ""; } })(),
+  pass: "",
   needed: false,
-  set(p) {
-    this.pass = p || "";
-    try { p ? localStorage.setItem("ledger:passPwd", p) : localStorage.removeItem("ledger:passPwd"); } catch {}
-  },
+  set(p) { this.pass = p || ""; },
   headers(extra) {
     const h = { ...(extra || {}) };
     if (this.pass) h["x-ledger-pass"] = this.pass;
@@ -179,24 +206,18 @@ export async function api(path, opts = {}) {
   return json;
 }
 
-const store = {
+export const store = {
   cache: null,
   ready: false,
   _timer: null,
+  _pending: null,
   protectedRemote: null, // null = unknown, false = API is open to anyone
+  syncState: "idle",     // idle | saving | error
+  loaded: false,         // true only when the server's copy was actually read
   async init() {
     if (this.ready) return;
     this.cache = {};
-    // seed from localStorage first (works offline / instant)
-    try {
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        if (!key || !key.startsWith("ledger:") || SENSITIVE.test(key)) continue;
-        try { this.cache[key] = JSON.parse(localStorage.getItem(key)); }
-        catch { this.cache[key] = localStorage.getItem(key); }
-      }
-    } catch {}
-    // overlay the cloud copy (source of truth across devices)
+    this.loaded = false;
     try {
       const res = await fetch("/api/data", { cache: "no-store", headers: auth.headers() });
       if (res.status === 401) {
@@ -209,44 +230,68 @@ const store = {
         const json = await res.json();
         this.protectedRemote = !!(json && json.protected);
         const remote = json && json.data;
-        if (remote && typeof remote === "object" && Object.keys(remote).length) {
-          this.cache = { ...this.cache, ...remote };
-          try { for (const k in remote) localStorage.setItem(k, JSON.stringify(remote[k])); } catch {}
-        }
+        if (remote && typeof remote === "object") { this.cache = { ...remote }; this.loaded = true; }
       }
     } catch {}
     this.ready = true;
   },
   async get(k) {
-    if (this.cache && k in this.cache) return this.cache[k];
-    try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : null; } catch { return null; }
+    if (SENSITIVE.test(k)) { try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : null; } catch { return null; } }
+    return this.cache && k in this.cache ? this.cache[k] : null;
   },
   async set(k, v) {
+    if (SENSITIVE.test(k)) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} return; }
     if (!this.cache) this.cache = {};
     this.cache[k] = v;
-    try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { console.error(e); }
-    if (!SENSITIVE.test(k)) this._scheduleSync();
+    this._scheduleSync();
   },
   _scheduleSync() {
     if (this._timer) clearTimeout(this._timer);
-    this._timer = setTimeout(() => this._sync(), 800);
+    this._timer = setTimeout(() => { this._timer = null; this._sync(); }, 800);
   },
+  _setState(s) { this.syncState = s; window.dispatchEvent(new CustomEvent("ledger:sync", { detail: s })); },
   async _sync() {
     const payload = {};
     for (const k in this.cache) if (!SENSITIVE.test(k)) payload[k] = this.cache[k];
     // never push an empty ledger over a populated one
     if (!Object.keys(payload).length) return;
-    try {
-      await fetch("/api/data", {
-        method: "POST",
-        headers: auth.headers({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ data: payload }),
-      });
-    } catch { /* stays in localStorage; retries on next change */ }
+    this._setState("saving");
+    const run = (async () => {
+      try {
+        const res = await fetch("/api/data", {
+          method: "POST",
+          headers: auth.headers({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ data: payload }),
+        });
+        if (res.status === 401) { window.dispatchEvent(new CustomEvent("ledger:needs-passcode")); this._setState("error"); return; }
+        this._setState(res.ok ? "idle" : "error");
+      } catch { this._setState("error"); }
+    })();
+    this._pending = run;
+    await run;
+  },
+  /** Push any change still waiting for its debounce, then wait for it. */
+  async flush() {
+    if (this._timer) { clearTimeout(this._timer); this._timer = null; await this._sync(); }
+    else if (this._pending) await this._pending;
+  },
+  /** Forget everything held in memory (used on logout and after a restore). */
+  reset() {
+    if (this._timer) clearTimeout(this._timer);
+    this._timer = null; this._pending = null; this.cache = null; this.ready = false;
   },
 };
+
+/** Log out: save anything pending, then drop the passcode and the in-memory ledger. */
+export async function logout() {
+  try { await store.flush(); } catch {}
+  store.reset();
+  auth.set("");
+  window.dispatchEvent(new CustomEvent("ledger:logout"));
+}
 const K_CATS = "ledger:categories", K_EXP = "ledger:expenses", K_SET = "ledger:settings", K_INC = "ledger:income";
 const K_MAP = "ledger:merchantMap", K_STMTS = "ledger:stmts", K_AUDIT = "ledger:audit";
+const K_CREDITS = "ledger:credits", K_CMAP = "ledger:creditMap", K_GOALS = "ledger:goals", K_BAL = "ledger:balances";
 
 /* Transactions the categoriser would not guess at are parked under this id.
  * It deliberately isn't a real category, so the dashboard already rolls it into
@@ -299,40 +344,50 @@ const widthForRatio = (p) => {
 /* ------------------------------------------------------------------ */
 export default function ExpenseLedger() {
   const [loading, setLoading] = useState(true);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [categories, setCategories] = useState([]);
   const [income, setIncome] = useState([]);
   const [expenses, setExpenses] = useState([]);
   const [sym, setSym] = useState("₹");
-  const [selMonth, setSelMonth] = useState(monthKey(new Date()));
+  const [selMonth, setSelMonth] = useState(currentPeriod());
   const [manageOpen, setManageOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [quickOpen, setQuickOpen] = useState(false);
+  const [stmtOpen, setStmtOpen] = useState(false);
   const [merchantMap, setMerchantMap] = useState({});
-  const [hideEmpty, setHideEmpty] = useState(true);
   const [stmts, setStmts] = useState({});
   const [auditLog, setAuditLog] = useState([]);
-  const [needsPass, setNeedsPass] = useState(false);
-  const [passInput, setPassInput] = useState("");
+  const [credits, setCredits] = useState([]);
+  const [creditMap, setCreditMap] = useState({});
+  const [cardDue, setCardDue] = useState({});
+  const [goals, setGoals] = useState([]);
+  const [balances, setBalances] = useState({});
+  const [monthStart, setMonthStartState] = useState(1);
+  const [drill, setDrill] = useState(null);
+  const [splitting, setSplitting] = useState(null);
+  const [tagAll, setTagAll] = useState("");
   const [apiOpen, setApiOpen] = useState(false); // API reachable without a passcode
+  const [sync, setSync] = useState("idle");
 
-  const [fCat, setFCat] = useState("");
-  const [fAmt, setFAmt] = useState("");
-  const [fDate, setFDate] = useState(todayISO());
-  const [fNote, setFNote] = useState("");
-  const [fPerson, setFPerson] = useState([]);
-  const [fBank, setFBank] = useState(() => { try { return localStorage.getItem("ledger:lastBank") || ""; } catch { return ""; } });
+  const [lastBank, setLastBank] = useState(() => { try { return localStorage.getItem("ledger:lastBank") || ""; } catch { return ""; } });
   const [catPersonMap, setCatPersonMap] = useState(() => { try { return JSON.parse(localStorage.getItem("ledger:catPersonMap") || "{}"); } catch { return {}; } });
-  const [addedFlash, setAddedFlash] = useState(false);
   const [reportFlash, setReportFlash] = useState(false);
   const [backupFlash, setBackupFlash] = useState(false);
   const [view, setView] = useState("dashboard");
   const [editingId, setEditingId] = useState(null);
   const [editForm, setEditForm] = useState({});
   const [entrySearch, setEntrySearch] = useState("");
+  const entriesRef = React.useRef(null);
 
   /* ---- load once (with name-based expense remap on reseed) ---- */
   useEffect(() => {
     (async () => {
       await store.init();
+      if (!store.loaded) {
+        // Never seed or save anything unless the real ledger was read first —
+        // otherwise a network blip could push a blank ledger over the real one.
+        setLoadFailed(true); setLoading(false); return;
+      }
       const ver = await store.get("ledger:catVersion");
       let cats = await store.get(K_CATS);
       let inc = await store.get(K_INC);
@@ -341,6 +396,10 @@ export default function ExpenseLedger() {
       const mmap = (await store.get(K_MAP)) || {};
       const stmtsData = (await store.get(K_STMTS)) || {};
       const auditData = (await store.get(K_AUDIT)) || [];
+      const creditData = (await store.get(K_CREDITS)) || [];
+      const cmapData = (await store.get(K_CMAP)) || {};
+      const goalsData = (await store.get(K_GOALS)) || [];
+      const balData = (await store.get(K_BAL)) || {};
 
       if (ver !== CAT_VERSION || !cats || !cats.length) {
         const oldName = {};
@@ -364,8 +423,6 @@ export default function ExpenseLedger() {
         await store.set("ledger:catVersion", CAT_VERSION);
       }
       if (!inc) { inc = buildIncome(); await store.set(K_INC, inc); }
-      // Additive: bring in categories introduced after this ledger was seeded,
-      // without a reseed (which would reset hand-edited budgets).
       const missingNS = NONSPEND_SEED.filter((nm) => !cats.some((c) => c.name === nm));
       if (missingNS.length) {
         cats = [...cats, ...missingNS.map((name) => ({ id: uid(), name, section: NONSPEND_SECTION, recurring: true, monthly: flat(0) }))];
@@ -378,46 +435,61 @@ export default function ExpenseLedger() {
       setMerchantMap(mmap);
       setStmts(stmtsData);
       setAuditLog(auditData);
+      setCredits(creditData);
+      setCreditMap(cmapData);
+      setCardDue(settings.cardDue || {});
+      setGoals(goalsData);
+      setBalances(balData);
+      setMonthStart(settings.monthStart || 1);
+      setMonthStartState(settings.monthStart || 1);
+      setSelMonth(currentPeriod());
       setSym(settings.sym || "₹");
-      setNeedsPass(!!auth.needed);
       setApiOpen(store.protectedRemote === false);
       setLoading(false);
     })();
 
-    const onNeeds = () => setNeedsPass(true);
-    window.addEventListener("ledger:needs-passcode", onNeeds);
-    return () => window.removeEventListener("ledger:needs-passcode", onNeeds);
+    const onSync = (e) => setSync(e.detail);
+    // closing the tab with a save still in flight would lose it — ask first
+    const onLeave = (e) => { if (store._timer || store.syncState === "saving") { e.preventDefault(); e.returnValue = ""; } };
+    window.addEventListener("ledger:sync", onSync);
+    window.addEventListener("beforeunload", onLeave);
+    return () => { window.removeEventListener("ledger:sync", onSync); window.removeEventListener("beforeunload", onLeave); };
   }, []);
-
-  const submitPasscode = async (e) => {
-    e.preventDefault();
-    auth.set(passInput.trim());
-    try {
-      const j = await api("/api/data");
-      store.cache = { ...(store.cache || {}), ...(j.data || {}) };
-      setNeedsPass(false);
-      setPassInput("");
-      window.location.reload();
-    } catch {
-      auth.set("");
-      setPassInput("");
-    }
-  };
 
   const saveCats = useCallback((n) => { setCategories(n); store.set(K_CATS, n); }, []);
   const saveExps = useCallback((n) => { setExpenses(n); store.set(K_EXP, n); }, []);
-  const saveSym = useCallback((s) => { setSym(s); store.set(K_SET, { sym: s }); }, []);
+  const settingsNow = { sym, cardDue, monthStart };
+  const saveSym = (s) => { setSym(s); store.set(K_SET, { ...settingsNow, sym: s }); };
+  const saveCardDue = (n) => { setCardDue(n); store.set(K_SET, { ...settingsNow, cardDue: n }); };
+  const saveMonthStart = (n) => {
+    const v = Math.min(28, Math.max(1, parseInt(n, 10) || 1));
+    setMonthStart(v); setMonthStartState(v); setSelMonth(currentPeriod());
+    store.set(K_SET, { ...settingsNow, monthStart: v });
+  };
+  const saveGoals = (n) => { setGoals(n); store.set(K_GOALS, n); };
+  const setBalance = (bank, entry) => {
+    const n = { ...balances, [bank]: [entry, ...(balances[bank] || [])].slice(0, 12) };
+    setBalances(n); store.set(K_BAL, n);
+  };
+  const saveCredits = useCallback((n) => { setCredits(n); store.set(K_CREDITS, n); }, []);
   const saveStmts = useCallback((n) => { setStmts(n); store.set(K_STMTS, n); }, []);
   const saveAudit = useCallback((n) => { setAuditLog(n); store.set(K_AUDIT, n); }, []);
 
-  useEffect(() => { if (!fCat && categories.length) setFCat(categories[0].id); }, [categories, fCat]);
-
   /* ---- derived ---- */
   const catById = useMemo(() => { const m = {}; categories.forEach((c) => (m[c.id] = c)); return m; }, [categories]);
-  const isNonSpend = useCallback((catId) => catById[catId]?.section === NONSPEND_SECTION, [catById]);
-  const monthExpenses = useMemo(() => expenses.filter((e) => e.date.slice(0, 7) === selMonth), [expenses, selMonth]);
-  const spendMonthExpenses = useMemo(() => monthExpenses.filter((e) => !isNonSpend(e.cat)), [monthExpenses, isNonSpend]);
+  /* Refunds set against a category count as negative spend there. They live in
+   * credits; these read-only rows let every total net them off. */
+  const allExp = useMemo(() => [
+    ...expenses,
+    ...credits.filter((c) => c.kind === "refund" && c.cat).map((c) => ({
+      id: "rf:" + c.id, creditId: c.id, cat: c.cat, amount: -c.amount, date: c.date,
+      note: "Refund · " + (c.note || ""), bank: c.bank, refund: true,
+    })),
+  ], [expenses, credits]);
+  const monthExpenses = useMemo(() => allExp.filter((e) => periodOf(e.date) === selMonth), [allExp, selMonth]);
   const spentByCat = useMemo(() => { const m = {}; monthExpenses.forEach((e) => (m[e.cat] = (m[e.cat] || 0) + e.amount)); return m; }, [monthExpenses]);
+  const fig = useMonthFigures({ expenses: allExp, categories, catById, selMonth });
+  const alerts = useMemo(() => computeAlerts({ allExp, categories, catById, selMonth }), [allExp, categories, catById, selMonth]);
 
   const rows = useMemo(() => categories.map((c) => {
     const spent = spentByCat[c.id] || 0;
@@ -436,12 +508,13 @@ export default function ExpenseLedger() {
     [monthExpenses, catById]
   );
 
+  /* grouped rows — used by Analysis and the shareable report */
   const grouped = useMemo(() => {
     const out = [];
     SECTIONS.forEach((sec) => {
       const all = rows.filter((r) => r.section === sec);
       if (!all.length) return;
-      const vis = hideEmpty ? all.filter((r) => !(r.budget === 0 && r.spent === 0)) : all;
+      const vis = all.filter((r) => !(r.budget === 0 && r.spent === 0));
       if (!vis.length) return;
       out.push({
         section: sec,
@@ -459,64 +532,50 @@ export default function ExpenseLedger() {
       });
     }
     return out;
-  }, [rows, hideEmpty, orphanSpent]);
+  }, [rows, orphanSpent]);
 
-  const spendCats = useMemo(() => categories.filter((c) => c.section !== NONSPEND_SECTION), [categories]);
-  const totalBudget = useMemo(() => spendCats.reduce((s, c) => s + budgetFor(c, selMonth), 0), [spendCats, selMonth]);
-  const totalSpent = useMemo(() => spendMonthExpenses.reduce((s, e) => s + e.amount, 0), [spendMonthExpenses]);
-  const totalIncome = useMemo(() => income.reduce((s, l) => s + (l.monthly[mIdx(selMonth)] || 0), 0), [income, selMonth]);
-  const remaining = totalBudget - totalSpent;
-  const usedPct = totalBudget > 0 ? (totalSpent / totalBudget) * 100 : 0;
+  const totalBudget = fig.budget;
+  const totalSpent = fig.spent;
+  const mi = useMemo(() => monthIncome(credits, selMonth), [credits, selMonth]);
+  const totalIncome = mi.total;
   const net = totalIncome - totalSpent;
   const savingsRate = totalIncome > 0 ? (net / totalIncome) * 100 : 0;
-
   const overRows = rows.filter((r) => r.status === "over" || r.status === "unbudgeted");
-  const hiddenCount = hideEmpty
-    ? rows.filter((r) => r.budget === 0 && r.spent === 0).length
-    : 0;
-  const totalOver = overRows.reduce((s, r) => s + (r.budget > 0 ? r.spent - r.budget : r.spent), 0)
-    + (orphanSpent > 0 ? orphanSpent : 0);
-
-  const trend = useMemo(() => {
-    const keys = [];
-    for (let i = 5; i >= 0; i--) keys.push(shiftMonth(selMonth, -i));
-    return keys.map((k) => ({
-      label: monthLabel(k, { month: "short" }),
-      spent: expenses.filter((e) => e.date.slice(0, 7) === k && !isNonSpend(e.cat)).reduce((s, e) => s + e.amount, 0),
-      budget: spendCats.reduce((s, c) => s + budgetFor(c, k), 0),
-    }));
-  }, [expenses, spendCats, selMonth, isNonSpend]);
 
   /* ---- actions ---- */
-  const addExpense = () => {
-    const amt = parseFloat(fAmt);
-    if (!fCat || !amt || amt <= 0 || !fDate) return;
-    const personStr = fPerson.join(",");
-    const entry = { id: uid(), cat: fCat, amount: amt, date: fDate, note: fNote.trim() };
-    if (personStr) entry.person = personStr;
-    if (fBank) { entry.bank = fBank; try { localStorage.setItem("ledger:lastBank", fBank); } catch {} }
-    saveExps([entry, ...expenses]);
-    if (fPerson.length > 0) {
-      const next = { ...catPersonMap, [fCat]: fPerson };
-      setCatPersonMap(next);
-      try { localStorage.setItem("ledger:catPersonMap", JSON.stringify(next)); } catch {}
+  const addExpense = ({ cat, amount, date, note, person = [], bank, tags }) => {
+    if (!cat || !amount || amount <= 0 || !date) return;
+    const entry = { id: uid(), cat, amount, date, note: note || "", src: "manual" };
+    const tg = parseTags(tags);
+    if (tg.length) entry.tags = tg;
+    if (person.length) entry.person = person.join(",");
+    if (bank) { entry.bank = bank; setLastBank(bank); try { localStorage.setItem("ledger:lastBank", bank); } catch {} }
+    setExpenses((prev) => { const n = [entry, ...prev]; store.set(K_EXP, n); return n; });
+    if (person.length) {
+      setCatPersonMap((prev) => {
+        const next = { ...prev, [cat]: person };
+        try { localStorage.setItem("ledger:catPersonMap", JSON.stringify(next)); } catch {}
+        return next;
+      });
     }
-    setFAmt(""); setFNote(""); setFPerson([]);
-    setAddedFlash(true); setTimeout(() => setAddedFlash(false), 1600);
-    if (fDate.slice(0, 7) !== selMonth) setSelMonth(fDate.slice(0, 7));
+    if (periodOf(date) !== selMonth) setSelMonth(periodOf(date));
   };
-  const delExpense = (id) => saveExps(expenses.filter((e) => e.id !== id));
+  const delExpense = (id) => {
+    const e = expenses.find((x) => x.id === id);
+    if (e && !window.confirm(`Delete ${money(e.amount, sym)} · ${catById[e.cat]?.name || "Uncategorised"} on ${e.date}?`)) return;
+    saveExps(expenses.filter((x) => x.id !== id));
+  };
 
   const startEdit = (e) => {
     setEditingId(e.id);
-    setEditForm({ cat: e.cat, amount: String(e.amount), date: e.date, note: e.note || "", person: e.person || "", bank: e.bank || "" });
+    setEditForm({ cat: e.cat, amount: String(e.amount), date: e.date, note: e.note || "", person: e.person || "", bank: e.bank || "", tags: (e.tags || []).join(" ") });
   };
   const cancelEdit = () => setEditingId(null);
   const saveEdit = () => {
     const amt = parseFloat(editForm.amount);
     if (!editForm.cat || !amt || amt <= 0 || !editForm.date) return;
     saveExps(expenses.map((e) => e.id === editingId
-      ? { ...e, cat: editForm.cat, amount: amt, date: editForm.date, note: editForm.note.trim(), ...(editForm.person ? { person: editForm.person } : { person: undefined }), ...(editForm.bank ? { bank: editForm.bank } : { bank: undefined }) }
+      ? { ...e, cat: editForm.cat, amount: amt, date: editForm.date, note: editForm.note.trim(), ...(editForm.person ? { person: editForm.person } : { person: undefined }), ...(editForm.bank ? { bank: editForm.bank } : { bank: undefined }), tags: parseTags(editForm.tags).length ? parseTags(editForm.tags) : undefined }
       : e
     ));
     setEditingId(null);
@@ -525,7 +584,7 @@ export default function ExpenseLedger() {
   const backupData = () => {
     try {
       const data = {
-        _meta: { app: "Manali's Ledger", exportedAt: new Date().toISOString(), version: CAT_VERSION },
+        _meta: { app: "Manali's Ledger", exportedAt: new Date().toISOString(), version: CAT_VERSION, appVersion: APP_VERSION },
         "ledger:categories": categories,
         "ledger:income": income,
         "ledger:expenses": expenses,
@@ -533,13 +592,17 @@ export default function ExpenseLedger() {
         "ledger:merchantMap": merchantMap,
         "ledger:stmts": stmts,
         "ledger:catPersonMap": catPersonMap,
+        "ledger:credits": credits,
+        "ledger:goals": goals,
+        "ledger:balances": balances,
+        "ledger:creditMap": creditMap,
         "ledger:catVersion": CAT_VERSION,
       };
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "manali-ledger-backup-" + new Date().toISOString().slice(0, 10) + ".json";
+      a.download = "manali-ledger-backup-" + todayISO() + ".json";
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 4000);
       setBackupFlash(true); setTimeout(() => setBackupFlash(false), 1600);
@@ -552,10 +615,10 @@ export default function ExpenseLedger() {
     const lines = [
       `📊 *Manali's Ledger — ${mo}*`,
       "",
-      `💰 Income: ${fmt(totalIncome)}`,
+      mi.has ? `💰 Income received: ${fmt(totalIncome)}` : `💰 Income: awaiting bank statements`,
       `📋 Budgeted: ${fmt(totalBudget)}`,
       `💸 Spent: ${fmt(totalSpent)}`,
-      `🏦 Saved: ${fmt(net)} (${savingsRate.toFixed(0)}%)`,
+      ...(mi.has ? [`🏦 Saved: ${fmt(net)} (${savingsRate.toFixed(0)}%)`] : []),
       "",
       "*Category breakdown:*",
     ];
@@ -586,35 +649,77 @@ export default function ExpenseLedger() {
     } catch { alert(text); }
   };
 
-  const onImport = (newExpenses, newMap, bankSource, audit) => {
-    saveExps([...newExpenses, ...expenses]);
+  const onImport = (newExpenses, newMap, bankSource, audit, newCredits = [], summary = null) => {
+    if (summary && bankSource && (summary.balance != null || summary.amountDue != null)) setBalance(bankSource, { ...summary, src: "statement", at: new Date().toISOString() });
+    if (newExpenses.length) saveExps([...newExpenses, ...expenses]);
+    if (newCredits.length) saveCredits([...newCredits, ...credits]);
     if (newMap) { setMerchantMap(newMap); store.set(K_MAP, newMap); }
-    if (bankSource && newExpenses[0]?.date) {
-      const mk = newExpenses[0].date.slice(0, 7);
+    const firstDate = newExpenses[0]?.date || newCredits[0]?.date;
+    if (bankSource && firstDate) {
+      const mk = periodOf(firstDate);
       const cur = stmts[mk] || [];
       if (!cur.includes(bankSource)) saveStmts({ ...stmts, [mk]: [...cur, bankSource] });
     }
     if (audit) saveAudit([audit, ...auditLog].slice(0, 300));
     setImportOpen(false);
-    if (newExpenses[0]?.date) setSelMonth(newExpenses[0].date.slice(0, 7));
+    if (firstDate) setSelMonth(periodOf(firstDate));
     if (audit?.suspense) setView("suspense");
+    else if (newCredits.some((c) => c.kind === "unsure")) setView("income");
   };
 
   /* Clearing a Suspense row is the moment merchant memory learns something —
-   * the same payee should never land in Suspense twice for the same reason. */
+   * the same payee should never land in Suspense twice for the same reason.
+   * Learned under the payee-aware key the categoriser looks up. */
   const clearSuspense = (id, catId) => {
     const row = expenses.find((e) => e.id === id);
     if (!row || !catId) return;
     saveExps(expenses.map((e) => (e.id === id
       ? { ...e, cat: catId, prov: { layer: "manual", confidence: 1, reason: "cleared from Suspense" } }
       : e)));
-    const mk = normMerchant(row.note);
+    const mk = merchantKey(row.note);
     if (mk) { const m = { ...merchantMap, [mk]: catId }; setMerchantMap(m); store.set(K_MAP, m); }
     saveAudit([{
       id: uid(), at: new Date().toISOString(), kind: "suspense-cleared",
       note: row.note, amount: row.amount, bank: row.bank,
       to: categories.find((c) => c.id === catId)?.name || catId,
     }, ...auditLog].slice(0, 300));
+  };
+
+  /* Sorting a credit teaches the ledger that payer for next time (bank accounts only —
+   * card-statement credits are always bill payments or refunds). */
+  const setCreditKind = (id, kind) => {
+    const c = credits.find((x) => x.id === id);
+    if (!c) return;
+    saveCredits(credits.map((x) => (x.id === id ? { ...x, kind, prov: "manual" } : x)));
+    const mk = merchantKey(c.note);
+    if (mk && BANKS.find((b) => b.key === c.bank)?.mode !== "card") {
+      const m = { ...creditMap, [mk]: kind }; setCreditMap(m); store.set(K_CMAP, m);
+    }
+  };
+  const addCredit = (c) => saveCredits([c, ...credits]);
+  const setCreditCat = (id, cat) => saveCredits(credits.map((x) => (x.id === id ? { ...x, cat: cat || undefined } : x)));
+  /* Split one entry into several, one per category. The parts keep the date,
+   * note, account and tags, and remember which entry they came from. */
+  const splitEntry = (e, parts) => {
+    const pieces = parts.map((p, i) => ({ ...e, id: uid(), cat: p.cat, amount: p.amount, splitOf: e.id, note: e.note, prov: { layer: "manual", confidence: 1, reason: `split ${i + 1}/${parts.length}` } }));
+    const idx = expenses.findIndex((x) => x.id === e.id);
+    const next = expenses.slice(); next.splice(idx, 1, ...pieces);
+    saveExps(next); setSplitting(null);
+  };
+  const tagShown = (list, raw) => {
+    const tg = parseTags(raw); if (!tg.length) return;
+    const ids = new Set(list.filter((e) => !e.refund).map((e) => e.id));
+    saveExps(expenses.map((e) => (ids.has(e.id) ? { ...e, tags: [...new Set([...(e.tags || []), ...tg])] } : e)));
+    setTagAll("");
+  };
+  const delCredit = (id) => {
+    const c = credits.find((x) => x.id === id);
+    if (c && !window.confirm(`Delete the credit of ${money(c.amount, sym)} on ${c.date}?`)) return;
+    saveCredits(credits.filter((x) => x.id !== id));
+  };
+  const editDueDay = (id, value) => {
+    const d = parseInt(value, 10);
+    saveCats(categories.map((c) => (c.id !== id ? c : (d >= 1 && d <= 31 ? { ...c, dueDay: d } : (({ dueDay, ...rest }) => rest)(c)))));
   };
 
   const editCatAmount = (id, value) => {
@@ -631,61 +736,42 @@ export default function ExpenseLedger() {
   const delCategory = (id) => {
     const c = catById[id];
     const n = expenses.filter((e) => e.cat === id).length;
-    if (!window.confirm(n ? `Delete "${c.name}" and its ${n} logged expense${n > 1 ? "s" : ""}? Can't be undone.` : `Delete "${c.name}"?`)) return;
+    if (!window.confirm(n ? `Delete "${c.name}" and its ${n} logged expense${n > 1 ? "s" : ""}? (It can be brought back from History.)` : `Delete "${c.name}"?`)) return;
     saveCats(categories.filter((c) => c.id !== id));
     if (n) saveExps(expenses.filter((e) => e.cat !== id));
   };
 
-  const loadSample = () => {
-    const find = (nm) => categories.find((c) => c.name === nm)?.id;
-    const base = selMonth + "-";
-    const day = (d) => base + String(d).padStart(2, "0");
-    const raw = [
-      ["Grocery", 4200, 4, "DMart stock-up"],
-      ["Grocery", 3800, 17, "Vegetables + dairy"],
-      ["Grocery", 11500, 27, "Festive groceries"],
-      ["Food & Travel", 9200, 9, "Work travel + meals"],
-      ["Food & Travel", 6400, 14, "Weekend outing"],
-      ["Medical", 5600, 11, "Consultation + pharmacy"],
-      ["Holiday", 38000, 20, "Goa trip advance"],
-      ["Shopping", 7200, 22, "Clothes"],
-      ["Shopping", 3500, 6, "Home items"],
-      ["Entertainment", 2400, 13, "Movie + dinner"],
-      ["Bike", 1800, 8, "Servicing"],
-      ["Parlour", 900, 16, "Salon"],
-    ];
-    const sample = raw
-      .filter((r) => find(r[0]))
-      .map((r) => ({ id: uid(), cat: find(r[0]), amount: r[1], date: day(r[2]), note: r[3] }));
-    saveExps([...sample, ...expenses]);
-  };
+  /* Clicking a budget row shows that category's entries below. */
+  const pickBudgetRow = (r) => setDrill({ type: "cat", value: r.id, label: r.id === "__uncat__" ? "Uncategorised spend" : r.name });
 
   if (loading) return (<div className="ledger-root"><Styles /><div className="loading">Opening your ledger…</div></div>);
 
-  if (needsPass) return (
+  if (loadFailed) return (
     <div className="ledger-root"><Styles />
       <div className="passgate">
-        <form className="passcard" onSubmit={submitPasscode}>
-          <h2>Manali's Ledger</h2>
-          <p>Enter the ledger passcode to continue.</p>
-          <input type="password" autoFocus value={passInput} placeholder="Passcode"
-                 onChange={(e) => setPassInput(e.target.value)} />
-          <button className="btn-add" type="submit" disabled={!passInput.trim()}>Unlock</button>
-        </form>
+        <div className="passcard">
+          <h2>Couldn't load the ledger</h2>
+          <p>The server didn't answer. Nothing has been changed. Check your connection and try again.</p>
+          <button className="btn-add" onClick={() => window.dispatchEvent(new CustomEvent("ledger:reload"))}>Try again</button>
+        </div>
       </div>
     </div>
   );
 
   const suspenseRows = expenses.filter((e) => e.cat === SUSPENSE_ID)
     .sort((a, b) => (b.date || "").localeCompare(a.date || "") || b.amount - a.amount);
-
+  const stmtDone = (stmts[selMonth] || []).filter((k) => STMT_BANKS.some((b) => b.key === k)).length;
   const selIdxLabel = monthLabel(selMonth);
+  const tabs = [
+    ["dashboard", "Dashboard"], ["income", "Income"], ["calendar", "Calendar"], ["tags", "Trips & tags"], ["ask", "Ask"], ["analysis", "Analysis"],
+    ["suspense", "Suspense"], ["history", "History"], ["audit", "Audit"],
+  ];
 
   return (
     <div className="ledger-root">
       <Styles />
 
-      <header className="mast">
+      <header className="mast2">
         <div className="mast-title">
           <span className="mast-mark"><Wallet size={18} strokeWidth={2.2} /></span>
           <div>
@@ -693,100 +779,40 @@ export default function ExpenseLedger() {
             <p>FY 2026–27 · budget vs. spend, month by month</p>
           </div>
         </div>
-        <div className="mast-controls">
+
+        <nav className="navtabs" aria-label="Sections">
+          {tabs.map(([k, l]) => (
+            <button key={k} className={view === k ? "on" : ""} aria-current={view === k ? "page" : undefined} onClick={() => setView(k)}>
+              {l}{k === "suspense" && suspenseRows.length ? <span className="pill-count">{suspenseRows.length}</span> : null}
+              {k === "income" && mi.unsure ? <span className="pill-count">{mi.unsure}</span> : null}
+            </button>
+          ))}
+          <button onClick={() => setManageOpen(true)}>Budgets</button>
+        </nav>
+
+        <div className="mast-actions">
           <div className="monthnav">
             <button aria-label="Previous month" onClick={() => setSelMonth(shiftMonth(selMonth, -1))}><ChevronLeft size={18} /></button>
-            <span className="monthnav-label">{selIdxLabel}</span>
+            <span className="monthnav-label">{periodLabel(selMonth)}</span>
             <button aria-label="Next month" onClick={() => setSelMonth(shiftMonth(selMonth, 1))}><ChevronRight size={18} /></button>
           </div>
-          <button className="btn-ghost" onClick={() => setImportOpen(true)}><Upload size={15} /> Import</button>
-          <button className="btn-ghost" onClick={() => setManageOpen(true)}><SlidersHorizontal size={15} /> Budgets</button>
-          <button className={`btn-ghost${view === "analysis" ? " btn-ghost-active" : ""}`} onClick={() => setView(v => v === "analysis" ? "dashboard" : "analysis")}><BarChart2 size={15} /> Analysis</button>
-          <button className={`btn-ghost${view === "suspense" ? " btn-ghost-active" : ""}`} onClick={() => setView(v => v === "suspense" ? "dashboard" : "suspense")}>
-            <Info size={15} /> Suspense{suspenseRows.length ? <span className="pill-count">{suspenseRows.length}</span> : null}
+          <button className={`btn-ghost stmt-badge ${stmtDone === STMT_BANKS.length ? "done" : "todo"}`} aria-expanded={stmtOpen} onClick={() => setStmtOpen((v) => !v)} title="Statements imported this month">
+            {stmtDone === STMT_BANKS.length ? <Check size={15} /> : <TriangleAlert size={15} />} Statements <strong>{stmtDone}/{STMT_BANKS.length}</strong>
           </button>
-          <button className={`btn-ghost${view === "audit" ? " btn-ghost-active" : ""}`} onClick={() => setView(v => v === "audit" ? "dashboard" : "audit")}><Check size={15} /> Audit</button>
-          <button className={`btn-ghost${backupFlash ? " btn-ghost-active" : ""}`} onClick={backupData} title="Download a full backup of your ledger as a JSON file"><Download size={15} /> {backupFlash ? "Saved!" : "Backup"}</button>
-          <button className={`btn-ghost${reportFlash ? " btn-ghost-active" : ""}`} onClick={generateReport}><ArrowUpRight size={15} /> {reportFlash ? "Copied! 🎉" : "Share"}</button>
+          <button className="btn-dark" onClick={() => setImportOpen(true)}><Upload size={15} /> Import</button>
+          <button className="btn-ghost" onClick={backupData} title="Download a full backup of your ledger as a JSON file"><Download size={15} /> {backupFlash ? "Saved!" : "Backup"}</button>
+          <button className="btn-ghost" onClick={generateReport} title="Copy a WhatsApp-ready summary of this month"><ArrowUpRight size={15} /> {reportFlash ? "Copied!" : "Share"}</button>
+          <button className="btn-ghost btn-logout" onClick={() => logout()} title="Save and lock the ledger on this device"><LogOut size={15} /> Log out</button>
         </div>
       </header>
 
-      {/* log */}
-      <section className="panel logbar">
-        <div className="panel-head"><h2>Log an expense</h2></div>
-        <div className="logform">
-          <select value={fCat} onChange={(e) => {
-            const id = e.target.value; setFCat(id);
-            const saved = catPersonMap[id]; setFPerson(saved ? [...saved] : []);
-          }} aria-label="Category">
-            {SECTIONS.map((sec) => {
-              const opts = categories.filter((c) => c.section === sec);
-              if (!opts.length) return null;
-              return (<optgroup key={sec} label={sec}>{opts.map((c) => (<option key={c.id} value={c.id}>{c.name}</option>))}</optgroup>);
-            })}
-            {categories.some((c) => !SECTIONS.includes(c.section)) && (
-              <optgroup label="Other">{categories.filter((c) => !SECTIONS.includes(c.section)).map((c) => (<option key={c.id} value={c.id}>{c.name}</option>))}</optgroup>
-            )}
-          </select>
-          <div className="amt-input"><span>{sym.trim()}</span>
-            <input type="number" min="0" placeholder="Amount" value={fAmt} onChange={(e) => setFAmt(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addExpense()} />
-          </div>
-          <input type="date" value={fDate} onChange={(e) => setFDate(e.target.value)} aria-label="Date" />
-          <select className="bank-select" value={fBank} onChange={(e) => setFBank(e.target.value)} aria-label="Account / card used">
-            <option value="">&mdash; account &mdash;</option>
-            <BankOptions />
-          </select>
-          <input type="text" placeholder="Note (optional)" value={fNote} onChange={(e) => setFNote(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addExpense()} />
-          <button className={`btn-add${addedFlash ? " flash" : ""}`} onClick={addExpense}><Plus size={16} /> {addedFlash ? "Saved!" : "Add"}</button>
-          {catById[fCat] && (
-            <div className="person-row">
-              <span className="person-label">For:</span>
-              {["Sid", "Manali", "Saryu"].map((p) => (
-                <button key={p} type="button"
-                  className={`person-btn${fPerson.includes(p) ? " on" : ""}`}
-                  onClick={() => setFPerson((prev) => prev.includes(p) ? prev.filter((x) => x !== p) : [...prev, p])}>
-                  {p}
-                </button>
-              ))}
-              {fPerson.length > 1 && <span className="split-hint">split {fPerson.length} ways</span>}
-            </div>
-          )}
-        </div>
-      </section>
-
-      <StatementStatus stmts={stmts} selMonth={selMonth} onToggle={(key) => {
-        const cur = stmts[selMonth] || [];
-        const next = cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key];
-        saveStmts({ ...stmts, [selMonth]: next });
-      }} />
-
-      {/* summary strip */}
-      <section className="strip">
-        <Stat label="Budgeted" value={money(totalBudget, sym)} />
-        <Stat label="Spent" value={money(totalSpent, sym)} accent={usedPct > 100 ? "red" : "ink"} />
-        <Stat label="Remaining" value={moneySigned(remaining, sym)} accent={remaining < 0 ? "red" : "teal"} />
-        <Stat
-          label={net < 0 ? "Overspent" : "Net saved"}
-          value={moneySigned(net, sym)}
-          accent={net < 0 ? "red" : "teal"}
-          sub={totalIncome > 0 ? `${savingsRate.toFixed(0)}% savings rate` : null}
-        />
-      </section>
-
-      <div className="usebar-wrap">
-        <span className="usebar-label">
-          {usedPct.toFixed(0)}% of {monthLabel(selMonth, { month: "short" })} budget spent
-        </span>
-        <div className="usebar">
-          <div className="usebar-fill" style={{ width: `${Math.min(usedPct, 100)}%`, background: usedPct > 100 ? "var(--red)" : usedPct >= 80 ? "var(--amber)" : "var(--teal)" }} />
-        </div>
-        {usedPct > 100 && <span className="usebar-over num">+{(usedPct - 100).toFixed(0)}%</span>}
-      </div>
-
-      {overRows.length > 0 && (
-        <div className="alert">
-          <TriangleAlert size={17} strokeWidth={2.2} />
-          <span>You went over in <strong>{overRows.length}</strong> {overRows.length > 1 ? "categories" : "category"} this month — <strong>{money(totalOver, sym)}</strong> beyond plan.</span>
+      {stmtOpen && (
+        <div className="stmt-pop">
+          <StatementStatus stmts={stmts} selMonth={selMonth} onToggle={(key) => {
+            const cur = stmts[selMonth] || [];
+            const next = cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key];
+            saveStmts({ ...stmts, [selMonth]: next });
+          }} />
         </div>
       )}
 
@@ -796,136 +822,54 @@ export default function ExpenseLedger() {
           Set <code>LEDGER_PASSCODE</code> in the Vercel project settings to lock it.
         </div>
       )}
+      {sync === "error" && (
+        <div className="alert"><TriangleAlert size={17} /> <span>Your last change couldn't be saved to the server. Check your connection — it will retry on your next change.</span></div>
+      )}
 
       {view === "analysis" ? (
-        <AnalysisView grouped={grouped} sym={sym} selMonth={selMonth} expenses={expenses} categories={categories} catById={catById} />
+        <AnalysisView grouped={grouped} sym={sym} selMonth={selMonth} expenses={allExp} categories={categories} catById={catById} />
       ) : view === "suspense" ? (
         <SuspenseView rows={suspenseRows} categories={categories} sym={sym} onClear={clearSuspense}
                       onDelete={(id) => saveExps(expenses.filter((e) => e.id !== id))} />
       ) : view === "audit" ? (
         <AuditView log={auditLog} sym={sym} />
+      ) : view === "history" ? (
+        <HistoryView sym={sym} />
+      ) : view === "income" ? (
+        <IncomeView credits={credits} selMonth={selMonth} sym={sym} onSetKind={setCreditKind} onSetCat={setCreditCat} onAdd={addCredit} onDelete={delCredit} categories={categories} />
+      ) : view === "calendar" ? (
+        <CalendarView allExp={allExp} credits={credits} categories={categories} expenses={allExp} cardDue={cardDue} balances={balances} catById={catById} selMonth={selMonth} sym={sym} />
+      ) : view === "tags" ? (
+        <TagsView allExp={allExp} catById={catById} sym={sym} onOpen={(t) => setDrill({ type: "tag", value: t, label: t })} />
+      ) : view === "ask" ? (
+        <AskView />
       ) : (<>
-      <div className="grid">
-        {/* ledger */}
-        <section className="panel ledger-panel">
-          <div className="panel-head">
-            <h2>Where it went</h2>
-            <button className="toggle" onClick={() => setHideEmpty((v) => !v)}>
-              {hideEmpty ? <EyeOff size={14} /> : <Eye size={14} />}
-              {hideEmpty ? `Hiding ${hiddenCount} empty` : "Showing all"}
-            </button>
-          </div>
+      <KpiStrip fig={fig} mi={mi} sym={sym} selMonth={selMonth} />
+      <AlertsStrip alerts={alerts} sym={sym} onPick={(a) => setDrill(a.big ? { type: "merchant", value: merchantKey(a.name), label: a.name } : { type: "cat", value: a.id, label: a.name })} />
 
-          {grouped.length === 0 && <div className="empty">Nothing budgeted or spent in {selIdxLabel}.</div>}
-
-          {grouped.map((g) => {
-            const secOver = g.spent > g.budget && g.budget > 0;
-            return (
-              <div className={`sec${g.nonSpend ? " sec-nonspend" : ""}`} key={g.section}>
-                <div className="sec-head">
-                  <span className="sec-name">{g.section}</span>
-                  <span className="sec-sub num">
-                    <span className={!g.nonSpend && (secOver || g.budget === 0) ? "fig-over" : ""}>{money(g.spent, sym)}</span>
-                    <span className="row-of">{g.nonSpend ? " · not counted in spend" : g.budget > 0 ? ` / ${money(g.budget, sym)}` : " · unbudgeted"}</span>
-                  </span>
-                </div>
-                <div className="rows">
-                  {g.rows.map((r) => {
-                    const w = r.status === "tracked" ? (r.spent > 0 ? BUDGET_POS : 0) : widthForRatio(r.ratio === Infinity ? 1.6 : r.ratio);
-                    const under = Math.min(w, BUDGET_POS);
-                    const over = Math.max(0, w - BUDGET_POS);
-                    const underColor = r.status === "tracked" ? "var(--muted)" : r.status === "caution" ? "var(--amber)" : r.status === "unbudgeted" ? "var(--red-soft)" : "var(--teal)";
-                    const diff = r.budget > 0 ? r.spent - r.budget : r.spent;
-                    return (
-                      <div className="row" key={r.id}>
-                        <div className="row-top">
-                          <span className="row-name">{r.name}</span>
-                          <span className="row-fig num">
-                            <span className={r.status === "over" || r.status === "unbudgeted" ? "fig-over" : ""}>{money(r.spent, sym)}</span>
-                            <span className="row-of">{r.status === "tracked" ? "" : r.budget > 0 ? ` / ${money(r.budget, sym)}` : " · no budget"}</span>
-                          </span>
-                        </div>
-                        <div className="track">
-                          {r.budget > 0 && <span className="track-marker" style={{ left: `${BUDGET_POS}%` }} />}
-                          <span className="seg under" style={{ width: `${under}%`, background: underColor }} />
-                          {over > 0 && <span className="seg over" style={{ left: `${BUDGET_POS}%`, width: `${over}%` }} />}
-                        </div>
-                        <div className="row-foot num">
-                          {r.status === "over" && <span className="tag tag-red">{money(diff, sym)} over</span>}
-                          {r.status === "unbudgeted" && <span className="tag tag-red">unbudgeted spend</span>}
-                          {r.status === "caution" && <span className="tag tag-amber">{money(r.budget - r.spent, sym)} left</span>}
-                          {r.status === "ok" && r.spent > 0 && <span className="tag tag-teal">{money(r.budget - r.spent, sym)} left</span>}
-                          {r.status === "ok" && r.spent === 0 && <span className="tag tag-faint">nothing spent</span>}
-                          {r.status === "tracked" && <span className="tag tag-faint">{r.spent > 0 ? "tracked · not counted" : "nothing this month"}</span>}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            );
-          })}
-        </section>
-
-        {/* sidebar */}
-        <aside className="side">
-          <section className="panel">
-            <div className="panel-head"><h2>Cash flow · {monthLabel(selMonth, { month: "short", year: "numeric" })}</h2></div>
-            <div className="cf">
-              <div className="cf-line"><span>Budget</span><span className="num">{money(totalBudget, sym)}</span></div>
-              <div className="cf-line"><span>Spent</span><span className="num fig-over">− {money(totalSpent, sym)}</span></div>
-              <div className="cf-line cf-net">
-                <span>{remaining < 0 ? "Over budget" : "Remaining"}</span>
-                <span className={`num ${remaining < 0 ? "fig-over" : "fig-good"}`}>{money(remaining, sym)}</span>
-              </div>
-              <p className="cf-note">
-                {remaining >= 0
-                  ? `${money(remaining, sym)} left in this month's budget.`
-                  : `Over budget by ${money(-remaining, sym)} this month.`}
-              </p>
-            </div>
-          </section>
-
-          <section className="panel">
-            <div className="panel-head"><h2>6-month trend</h2></div>
-            <div className="chart">
-              <ResponsiveContainer width="100%" height={180}>
-                <ComposedChart data={trend} margin={{ top: 6, right: 4, left: -14, bottom: 0 }}>
-                  <XAxis dataKey="label" tick={{ fontSize: 11, fill: "var(--muted)" }} axisLine={false} tickLine={false} />
-                  <YAxis tick={{ fontSize: 10, fill: "var(--faint)" }} axisLine={false} tickLine={false}
-                    tickFormatter={(v) => (v >= 100000 ? `${sym}${(v / 100000).toFixed(1)}L` : v >= 1000 ? `${sym}${Math.round(v / 1000)}k` : `${sym}${v}`)} />
-                  <Tooltip cursor={{ fill: "rgba(0,0,0,0.04)" }}
-                    contentStyle={{ borderRadius: 10, border: "1px solid var(--hairline)", fontSize: 12, fontFamily: "Inter, sans-serif" }}
-                    formatter={(v, n) => [money(v, sym), n === "spent" ? "Spent" : "Budget"]} />
-                  <Legend wrapperStyle={{ fontSize: 11, paddingTop: 4 }} iconType="plainline" />
-                  <Bar dataKey="spent" name="Spent" radius={[4, 4, 0, 0]} maxBarSize={26}>
-                    {trend.map((d, i) => (<Cell key={i} fill={d.budget > 0 && d.spent > d.budget ? "var(--red)" : "var(--teal)"} />))}
-                  </Bar>
-                  <Line dataKey="budget" name="Budget" stroke="var(--ink)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} />
-                </ComposedChart>
-              </ResponsiveContainer>
-            </div>
-            <p className="chart-note">Dashed line is each month's planned budget — it shifts with your annual items (LIC, insurance, etc.). Bars turn red on months you ran over.</p>
-          </section>
-
-          {overRows.length > 0 && (
-            <section className="panel">
-              <div className="panel-head"><h2>Trim these first</h2></div>
-              <ul className="overlist">
-                {overRows.slice().sort((a, b) => (b.budget > 0 ? b.spent - b.budget : b.spent) - (a.budget > 0 ? a.spent - a.budget : a.spent)).map((r) => (
-                  <li key={r.id}><span>{r.name}</span><span className="num fig-over"><ArrowUpRight size={13} strokeWidth={2.5} />{money(r.budget > 0 ? r.spent - r.budget : r.spent, sym)}</span></li>
-                ))}
-              </ul>
-            </section>
-          )}
-        </aside>
+      <div className="cards">
+        <PaceCard fig={fig} catById={catById} selMonth={selMonth} sym={sym} />
+        <BillsCard categories={categories} expenses={allExp} credits={credits} cardDue={cardDue} balances={balances} selMonth={selMonth} sym={sym} onSetDue={() => setManageOpen(true)} />
+      </div>
+      <div className="cards">
+        <BudgetsCard fig={fig} categories={categories} catById={catById} selMonth={selMonth} sym={sym}
+          onPick={pickBudgetRow} onEditBudgets={() => setManageOpen(true)} />
+        <StructureCard fig={fig} catById={catById} sym={sym} />
+      </div>
+      <div className="cards">
+        <CashFlowCard expenses={allExp} credits={credits} categories={categories} cardDue={cardDue} balances={balances} catById={catById} selMonth={selMonth} sym={sym} />
+        <PayeesCard fig={fig} catById={catById} sym={sym} onPick={setDrill} />
+        <SetAsideCard categories={categories} selMonth={selMonth} sym={sym} />
+      </div>
+      <div className="cards">
+        <BalancesCard balances={balances} credits={credits} sym={sym} onSet={setBalance} />
+        <GoalsCard goals={goals} sym={sym} onSave={saveGoals} />
       </div>
 
       {/* entries */}
-      <section className="panel">
+      <section className="panel" ref={entriesRef}>
         <div className="panel-head">
-          <h2>{monthLabel(selMonth, { month: "long" })} entries</h2>
-          {monthExpenses.length === 0 && expenses.length === 0 && (<button className="btn-sample" onClick={loadSample}><Sparkles size={14} /> Load sample month</button>)}
+          <h2>{monthLabel(selMonth, { month: "long" })} entries <span className="sub num">· {monthExpenses.length}</span></h2>
         </div>
         {monthExpenses.length > 0 && (
           <div className="entry-search">
@@ -943,7 +887,7 @@ export default function ExpenseLedger() {
           </div>
         )}
         {monthExpenses.length === 0 ? (
-          <div className="empty">No expenses logged for this month yet.</div>
+          <div className="empty">No expenses logged for this month yet. Use “Add expense” or Import.</div>
         ) : (() => {
           const q = entrySearch.trim().toLowerCase();
           const filtered = monthExpenses.filter((e) => {
@@ -955,13 +899,21 @@ export default function ExpenseLedger() {
               bankLbl || "",
               e.person || "",
               String(e.amount),
+              ...(e.tags || []).map((t) => "#" + t),
             ].join(" ").toLowerCase();
-            return hay.includes(q);
+            return q.split(/\s+/).every((w) => hay.includes(w));
           });
           if (filtered.length === 0) {
             return <div className="empty">No entries match “{entrySearch}”.</div>;
           }
-          return (
+          return (<>
+          {q && (
+            <div className="tagall">
+              <Tag size={14} /> Tag all {filtered.filter((e) => !e.refund).length} shown as
+              <input value={tagAll} onChange={(ev) => setTagAll(ev.target.value)} placeholder="e.g. bangkok2026" onKeyDown={(ev) => ev.key === "Enter" && tagShown(filtered, tagAll)} aria-label="Tag to add" />
+              <button className="btn-ghost sm" disabled={!tagAll.trim()} onClick={() => tagShown(filtered, tagAll)}>Add tag</button>
+            </div>
+          )}
           <ul className="entries">
             {filtered.slice().sort((a, b) => b.date.localeCompare(a.date)).map((e) => {
               if (editingId === e.id) {
@@ -984,6 +936,7 @@ export default function ExpenseLedger() {
                       <BankOptions />
                     </select>
                     <input className="en-edit-note" type="text" placeholder="Note" value={editForm.note} onChange={(ev) => setEditForm({ ...editForm, note: ev.target.value })} onKeyDown={(ev) => ev.key === "Enter" && saveEdit()} />
+                    <input className="en-edit-note" type="text" placeholder="Tags, e.g. diwali bangkok2026" value={editForm.tags || ""} onChange={(ev) => setEditForm({ ...editForm, tags: ev.target.value })} onKeyDown={(ev) => ev.key === "Enter" && saveEdit()} aria-label="Tags" />
                     <div className="en-edit-btns">
                       <button className="icon-btn" aria-label="Save" onClick={saveEdit}><Check size={14} strokeWidth={2.5} style={{ color: "var(--teal)" }} /></button>
                       <button className="icon-btn" aria-label="Cancel" onClick={cancelEdit}><X size={14} /></button>
@@ -992,30 +945,52 @@ export default function ExpenseLedger() {
                 );
               }
               return (
-                <li key={e.id}>
+                <li key={e.id} className={e.refund ? "en-refund" : ""}>
                   <span className="en-date num">{e.date.slice(8, 10)} {monthLabel(e.date.slice(0, 7), { month: "short" })}</span>
                   <span className="en-cat">{catById[e.cat]?.name || "Uncategorised"}</span>
                   <span className="en-bank">{BANKS.find(b => b.key === e.bank)?.label || (e.src === "import" ? e.bank : "—")}</span>
-                  <span className="en-note">{e.note || "—"}{e.person && e.person.split(",").map((p) => <span key={p} className="person-tag">{p}</span>)}</span>
-                  <span className="en-amt num">{money(e.amount, sym)}</span>
-                  <button className="en-del" aria-label="Edit entry" onClick={() => startEdit(e)}><Pencil size={13} /></button>
-                  <button className="en-del" aria-label="Delete entry" onClick={() => delExpense(e.id)}><Trash2 size={14} /></button>
+                  <span className="en-note">{e.note || "—"}{e.splitOf && <span className="en-split">split</span>}{e.person && e.person.split(",").map((p) => <span key={p} className="person-tag">{p}</span>)}{(e.tags || []).map((t) => <button key={t} type="button" className="tag-chip" style={{ border: 0, cursor: "pointer" }} onClick={() => setDrill({ type: "tag", value: t, label: t })}>#{t}</button>)}</span>
+                  <span className="en-amt num">{moneySigned(e.amount, sym)}</span>
+                  {e.refund ? (
+                    <span className="en-del" title="A refund — change it in the Income tab" style={{ gridColumn: "span 2", fontSize: 10.5, fontWeight: 600, color: "var(--teal)", width: "auto" }}>refund</span>
+                  ) : (<>
+                    <span className="en-btns">
+                      <button className="en-del" aria-label="Split entry across categories" title="Split across categories" onClick={() => setSplitting(e)}><Scissors size={13} /></button>
+                      <button className="en-del" aria-label="Edit entry" onClick={() => startEdit(e)}><Pencil size={13} /></button>
+                    </span>
+                    <button className="en-del" aria-label="Delete entry" onClick={() => delExpense(e.id)}><Trash2 size={14} /></button>
+                  </>)}
                 </li>
               );
             })}
           </ul>
-          );
+          </>);
         })()}
       </section>
-
       </>)}
+
+      <button className="fab" onClick={() => setQuickOpen(true)} aria-label="Add expense">
+        <Plus size={22} strokeWidth={2.5} /> <span className="fab-label">Add expense</span>
+      </button>
+
+      {drill && <DrillDown filter={drill} allExp={allExp} catById={catById} sym={sym} onClose={() => setDrill(null)} />}
+      {splitting && <SplitModal entry={splitting} categories={categories} sym={sym} onClose={() => setSplitting(null)} onSave={(parts) => splitEntry(splitting, parts)} />}
+
+      {quickOpen && (
+        <QuickAdd categories={categories} expenses={expenses} catPersonMap={catPersonMap} defaultBank={lastBank} sym={sym}
+          onSave={addExpense} onClose={() => setQuickOpen(false)} />
+      )}
 
       {importOpen && (
         <ImportWizard categories={categories} sym={sym} merchantMap={merchantMap} existing={expenses}
+          existingCredits={credits} creditMap={creditMap}
           onClose={() => setImportOpen(false)} onImport={onImport} />
       )}
 
-      <footer className="foot">Manali's Ledger · FY 2026–27 · everything you log is saved on this device.</footer>
+      <footer className="foot">
+        Manali's Ledger v{APP_VERSION} · saved to the cloud, nothing kept on this device ·{" "}
+        <span className={`sync${sync === "error" ? " error" : ""}`}>{sync === "saving" ? "Saving…" : sync === "error" ? "Not saved" : "All changes saved"}</span>
+      </footer>
 
       {/* drawer */}
       {manageOpen && (
@@ -1028,6 +1003,13 @@ export default function ExpenseLedger() {
             <p className="drawer-hint">Editing amounts for <strong>{selIdxLabel}</strong>. Flat budgets update every month; budgets that vary month-to-month update just this one.</p>
 
             <div className="cur-row">
+              <span>Month starts on day</span>
+              <span className="ms-row" style={{ padding: 0 }}>
+                <input type="number" min="1" max="28" value={monthStart} onChange={(e) => saveMonthStart(e.target.value)} aria-label="Month starts on day" />
+                <span style={{ fontSize: 12, color: "var(--muted)" }}>{monthStart === 1 ? "calendar months" : `e.g. this month = ${periodLabel(currentPeriod())}`}</span>
+              </span>
+            </div>
+            <div className="cur-row">
               <span>Currency</span>
               <div className="cur-pills">{CURRENCIES.map((c) => (<button key={c} className={c === sym ? "cur on" : "cur"} onClick={() => saveSym(c)}>{c.trim()}</button>))}</div>
             </div>
@@ -1038,16 +1020,39 @@ export default function ExpenseLedger() {
               return (
                 <div className="cat-list" key={sec}>
                   <div className="cat-head"><span>{sec}</span><span>Budget</span><span /></div>
-                  {list.map((c) => (
-                    <div className="cat-edit" key={c.id}>
-                      <input value={c.name} onChange={(e) => editCatName(c.id, e.target.value)} />
-                      <div className="amt-input sm"><span>{sym.trim()}</span><input type="number" min="0" value={c.monthly[mIdx(selMonth)] || 0} onChange={(e) => editCatAmount(c.id, e.target.value)} /></div>
-                      <button className="icon-btn danger" aria-label="Delete" onClick={() => delCategory(c.id)}><Trash2 size={15} /></button>
+                  {list.map((c) => {
+                    const bill = isBillCat(c);
+                    const dd = bill ? dueDayOf({ ...c, dueDay: undefined }, expenses) : null;
+                    return (
+                    <div className="cat-edit-wrap" key={c.id}>
+                      <div className="cat-edit">
+                        <input value={c.name} onChange={(e) => editCatName(c.id, e.target.value)} />
+                        <div className="amt-input sm"><span>{sym.trim()}</span><input type="number" min="0" value={c.monthly[mIdx(selMonth)] || 0} onChange={(e) => editCatAmount(c.id, e.target.value)} /></div>
+                        <button className="icon-btn danger" aria-label="Delete" onClick={() => delCategory(c.id)}><Trash2 size={15} /></button>
+                      </div>
+                      {bill && (
+                        <label className="due-row">Due on day
+                          <input className="due-in" type="number" min="1" max="31" value={c.dueDay || ""} placeholder={dd ? String(dd.day) : "—"} onChange={(e) => editDueDay(c.id, e.target.value)} />
+                          <span>{c.dueDay ? "of the month" : dd ? `(usually paid by the ${ordinal(dd.day)} — leave blank to use that)` : "(not enough history yet)"}</span>
+                        </label>
+                      )}
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               );
             })}
+
+            <div className="cat-list">
+              <div className="cat-head"><span>Credit card payment due dates</span><span /><span /></div>
+              {BANKS.filter((b) => b.mode === "card").map((b) => (
+                <label className="due-row" key={b.key} style={{ paddingLeft: 0 }}>{b.label}: due on day
+                  <input className="due-in" type="number" min="1" max="31" value={cardDue[b.key] || ""} placeholder="—"
+                    onChange={(e) => { const d = parseInt(e.target.value, 10); const n = { ...cardDue }; if (d >= 1 && d <= 31) n[b.key] = d; else delete n[b.key]; saveCardDue(n); }} />
+                  <span>— the bill shown is last month's spend on the card</span>
+                </label>
+              ))}
+            </div>
 
             <button className="btn-ghost full" onClick={addCategory}><Plus size={15} /> Add category</button>
             <div className="drawer-total"><span>Total budget · {monthLabel(selMonth, { month: "short" })}</span><strong className="num">{money(totalBudget, sym)}</strong></div>
@@ -1095,7 +1100,7 @@ function AnalysisView({ grouped, sym, selMonth, expenses = [], categories = [], 
   const spendExp = useMemo(() => expenses.filter((e) => !nonSpend(e.cat)), [expenses, catById]);
   const spendCats = useMemo(() => categories.filter((c) => c.section !== NONSPEND_SECTION), [categories]);
   const monthExp = useMemo(
-    () => spendExp.filter((e) => e.date.slice(0, 7) === selMonth),
+    () => spendExp.filter((e) => periodOf(e.date) === selMonth),
     [spendExp, selMonth]
   );
 
@@ -1138,7 +1143,7 @@ function AnalysisView({ grouped, sym, selMonth, expenses = [], categories = [], 
     return keys.map((k) => ({
       key: k,
       name: monthLabel(k, { month: "short" }),
-      spent: Math.round(spendExp.filter((e) => e.date.slice(0, 7) === k).reduce((s, e) => s + e.amount, 0)),
+      spent: Math.round(spendExp.filter((e) => periodOf(e.date) === k).reduce((s, e) => s + e.amount, 0)),
       budget: Math.round(spendCats.reduce((s, c) => s + budgetFor(c, k), 0)),
     }));
   }, [spendExp, spendCats]);
@@ -1297,7 +1302,7 @@ function CategoryMoM({ expenses, categories, catById, selMonth, sym }) {
     const spent = {}; // catId -> monthKey -> amt
     const inFYk = new Set(keys);
     expenses.forEach((e) => {
-      const k = e.date.slice(0, 7);
+      const k = periodOf(e.date);
       if (!inFYk.has(k)) return;
       const id = catById[e.cat] ? e.cat : "__uncat__";
       if (!spent[id]) spent[id] = {};
@@ -1624,7 +1629,7 @@ function CatSelect({ categories, value, onChange, hint }) {
 /* OLE compound file (D0 CF 11 E0): a legacy .xls, or an encrypted .xlsx wrapper. */
 const isOleFile = (buf) => { const b = new Uint8Array(buf, 0, Math.min(8, buf.byteLength)); return b[0] === 0xd0 && b[1] === 0xcf && b[2] === 0x11 && b[3] === 0xe0; };
 const fileToB64 = (f) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.onerror = () => rej(r.error); r.readAsDataURL(f); });
-function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImport }) {
+function ImportWizard({ categories, sym, merchantMap, existing, existingCredits = [], creditMap = {}, onClose, onImport }) {
   const [step, setStep] = useState("upload");
   const [viaAPI, setViaAPI] = useState(false);
   const [fileName, setFileName] = useState("");
@@ -1662,11 +1667,31 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
   const [diag, setDiag] = useState(null);        // how the statement was read
   const [catSummary, setCatSummary] = useState(null); // how categorisation went
   const [autoBy, setAutoBy] = useState({});      // key -> {layer, confidence, reason, candidates}
+  // Money in: every credit on the statement, sorted into a kind (see src/income.jsx)
+  const [credTx, setCredTx] = useState([]);
+  const [credKinds, setCredKinds] = useState({});
+  const [credInclude, setCredInclude] = useState({});
+  const [credDup, setCredDup] = useState({});
+  const [credCats, setCredCats] = useState({});
+  const [stmtSummary, setStmtSummary] = useState(null);
+  const existingCreditKeys = useMemo(() => new Set(existingCredits.map(creditDupKey)), [existingCredits]);
+  const stageCredits = (list, bank) => {
+    const k = {}, inc = {}, dp = {}, cc = {};
+    const out = list.map((t, i) => {
+      const key = "c" + i;
+      const cls = classifyCredit({ ...t, bank }, { creditMap, expenses: existing || [] });
+      if (cls.kind === "refund") cc[key] = guessRefundCat(t.desc, existing);
+      const isDup = existingCreditKeys.has(creditDupKey({ ...t, note: t.desc, bank }));
+      k[key] = cls.kind; inc[key] = !isDup; dp[key] = isDup;
+      return { ...t, key, reason: cls.reason };
+    });
+    setCredTx(out); setCredKinds(k); setCredInclude(inc); setCredDup(dp); setCredCats(cc);
+  };
   const dupKey = (date, amount, desc) => `${date}|${Math.round(amount)}|${normMerchant(desc)}`;
   const existingKeys = useMemo(() => new Set((existing || []).map((e) => dupKey(e.date, e.amount, e.note))), [existing]);
 
-  const toReview = (out, fromAPI) => {
-    if (!out.length) { setErr("No expense transactions were found. For tabular files, check the column mapping; for PDFs, try a clearer copy or a CSV/Excel export."); if (fromAPI) setStep("upload"); return; }
+  const toReview = (out, fromAPI, hasCredits = false) => {
+    if (!out.length && !hasCredits) { setErr("No expense transactions were found. For tabular files, check the column mapping; for PDFs, try a clearer copy or a CSV/Excel export."); if (fromAPI) setStep("upload"); return; }
     const asg = {}, inc = {}, dp = {}, by = {};
     out.forEach((t) => {
       const isDup = existingKeys.has(dupKey(t.date, t.amount, t.desc));
@@ -1764,17 +1789,36 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
       setDiag(ex.diagnostics || null);
 
       const debits = (ex.transactions || []).filter((t) => t.kind !== "credit");
-      if (!debits.length) {
-        setErr((ex.transactions || []).length
-          ? "That statement only contained credits — nothing to add as spend."
-          : "No transactions could be read from that statement.");
+      const creds = (ex.transactions || []).filter((t) => t.kind === "credit");
+      if (!debits.length && !creds.length) {
+        setErr("No transactions could be read from that statement.");
         setStep("upload");
         return;
+      }
+      stageCredits(creds.map((t) => ({ date: t.date, desc: t.description, amount: t.amount })), bank);
+      // Statement figures for the balances card: closing balance = the last
+      // running balance in the statement; card dues come from the summary box.
+      {
+        const withBal = (ex.transactions || []).filter((t) => t.balance != null && !isNaN(t.balance));
+        const last = withBal.length ? withBal.reduce((a, t) => (t.date >= a.date ? t : a), withBal[0]) : null;
+        const sm = ex.summary || {};
+        const isCard = BANKS.find((b) => b.key === bank)?.mode === "card";
+        const lastDate = (ex.transactions || []).reduce((m, t) => (t.date > m ? t.date : m), "");
+        const summary = {
+          asOf: sm.statementDate || (last && last.date) || lastDate || null,
+          ...(isCard ? {} : { balance: sm.closingBalance ?? (last ? last.balance : null) }),
+          ...(sm.amountDue != null ? { amountDue: sm.amountDue } : {}),
+          ...(sm.minDue != null ? { minDue: sm.minDue } : {}),
+          ...(sm.dueDate ? { dueDate: sm.dueDate } : {}),
+          ...(sm.statementDate ? { statementDate: sm.statementDate } : {}),
+          file: file.name,
+        };
+        setStmtSummary(summary.balance != null || summary.amountDue != null ? summary : null);
       }
 
       setProgress(`Categorising ${debits.length} transactions…`);
       let results = [];
-      try {
+      if (debits.length) try {
         const cat = await api("/api/categorize", {
           method: "POST",
           body: JSON.stringify({
@@ -1792,7 +1836,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
         key: bank + i, date: t.date, desc: t.description, amount: t.amount,
         auto: results[i] || null,
       }));
-      toReview(list, ex.diagnostics?.source === "claude");
+      toReview(list, ex.diagnostics?.source === "claude", creds.length > 0);
     } catch (ex) {
       console.error(ex);
       setErr(String(ex.message || ex));
@@ -1823,19 +1867,25 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
   const colOpts = headerCells.map((h, i) => ({ i, label: colLabel(i, h) }));
 
   const buildTxns = () => {
-    const out = [];
+    const out = [], creds = [];
     for (let r = headerRow + 1; r < rows.length; r++) {
       const row = rows[r]; if (!row) continue;
       const date = parseDate(row[map.date], dateFmt);
       const desc = String(map.desc >= 0 ? (row[map.desc] ?? "") : "").trim();
-      let amount = NaN;
-      if (amountMode === "split") amount = parseAmount(row[map.debit]);
-      else { const a = parseAmount(row[map.amount]); if (!isNaN(a)) amount = (singleSign === "pos" ? a : -a); }
-      if (isNaN(amount) || amount <= 0) continue;
       if (!desc && !date) continue;
-      out.push({ key: r, date, desc, amount });
+      let amount = NaN, credit = NaN;
+      if (amountMode === "split") {
+        amount = parseAmount(row[map.debit]);
+        if (map.credit >= 0) credit = parseAmount(row[map.credit]);
+      } else {
+        const a = parseAmount(row[map.amount]);
+        if (!isNaN(a)) { amount = (singleSign === "pos" ? a : -a); if (amount < 0) { credit = -amount; amount = NaN; } }
+      }
+      if (!isNaN(amount) && amount > 0) out.push({ key: r, date, desc, amount });
+      else if (!isNaN(credit) && credit > 0 && date) creds.push({ date, desc, amount: credit });
     }
-    toReview(out, false);
+    stageCredits(creds, bankSource);
+    toReview(out, false, creds.length > 0);
   };
 
   const visible = txns.filter((t) => {
@@ -1858,7 +1908,13 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
     // does not block the batch — it goes to Suspense, where it still counts
     // against the month's spend until it is cleared.
     const picked = txns.filter((t) => include[t.key]);
-    if (!picked.length) return;
+    const pickedCredits = credTx.filter((t) => credInclude[t.key]);
+    if (!picked.length && !pickedCredits.length) return;
+    const newCredits = pickedCredits.map((t) => ({
+      id: uid(), date: t.date, amount: t.amount, note: t.desc || "Credit", bank: bankSource,
+      kind: credKinds[t.key], src: "import", prov: credKinds[t.key] === "unsure" ? "unsure" : "auto",
+      ...(credKinds[t.key] === "refund" && credCats[t.key] ? { cat: credCats[t.key] } : {}),
+    }));
 
     const expenses = picked.map((t) => {
       const cat = assign[t.key] || SUSPENSE_ID;
@@ -1897,7 +1953,9 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
       at: new Date().toISOString(),
       bank: bankSource,
       file: fileName,
-      month: expenses[0]?.date?.slice(0, 7) || "",
+      month: (expenses[0]?.date || newCredits[0]?.date || "").slice(0, 7),
+      credits: newCredits.length,
+      income: +newCredits.filter((c) => CREDIT_KINDS[c.kind]?.income).reduce((s, c) => s + c.amount, 0).toFixed(2),
       found: txns.length,
       imported: expenses.length,
       skippedAsDuplicate: txns.filter((t) => dup[t.key] && !include[t.key]).length,
@@ -1915,7 +1973,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
       categoriser: catSummary || null,
     };
 
-    onImport(expenses, newMap, bankSource, audit);
+    onImport(expenses, newMap, bankSource, audit, newCredits, stmtSummary);
   };
 
   return (
@@ -2023,7 +2081,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
                   <input type="file" accept=".pdf,.PDF" onChange={handleBOMFile} hidden />
                 </label>
               </div>
-              <div className="imp-note"><Info size={14} /> Password is saved in your browser. Only debits are imported — credits and internal transfers are excluded.</div>
+              <div className="imp-note"><Info size={14} /> Password is saved in your browser. Debits become expenses; credits are recorded under Income (salary and rent count, transfers and refunds don't).</div>
             </div>
             <div className="imp-divider">or</div>
             <div className="sbi-block">
@@ -2041,7 +2099,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
                   <input type="file" accept=".xlsx,.xls,.pdf" onChange={handleUBIFile} hidden />
                 </label>
               </div>
-              <div className="imp-note"><Info size={14} /> Only withdrawals are imported. UBI statements include your own category labels — these appear as descriptions.</div>
+              <div className="imp-note"><Info size={14} /> Withdrawals become expenses and deposits are recorded under Income. UBI statements include your own category labels — these appear as descriptions.</div>
             </div>
             <div className="imp-divider">or</div>
             <div className="sbi-block">
@@ -2059,7 +2117,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
                   <input type="file" accept=".pdf" onChange={handleHDFCBankFile} hidden />
                 </label>
               </div>
-              <div className="imp-note"><Info size={14} /> Password is saved in your browser. Only debits are imported — salary credits and refunds are excluded. CC bill payments appear here AND in CC statements; skip the duplicates in the review step.</div>
+              <div className="imp-note"><Info size={14} /> Password is saved in your browser. Debits become expenses; credits (salary, rent, refunds) are recorded under Income. CC bill payments appear here AND in CC statements; skip the duplicates in the review step.</div>
             </div>
           </div>
         )}
@@ -2109,7 +2167,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
             {amountMode === "split" ? (
               <div className="map-grid">
                 <Field label="Debit / withdrawal (money out)"><ColSelect value={map.debit} opts={colOpts} onChange={(v) => setMap({ ...map, debit: v })} /></Field>
-                <Field label="Credit / deposit (ignored)"><ColSelect value={map.credit} opts={colOpts} onChange={(v) => setMap({ ...map, credit: v })} allowNone /></Field>
+                <Field label="Credit / deposit (recorded as money in)"><ColSelect value={map.credit} opts={colOpts} onChange={(v) => setMap({ ...map, credit: v })} allowNone /></Field>
               </div>
             ) : (
               <div className="map-grid">
@@ -2135,7 +2193,8 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
           const includedCount = txns.filter((t) => include[t.key]).length;
           const uncatCount = txns.filter((t) => include[t.key] && !assign[t.key]).length;
           const autoCount = txns.filter((t) => include[t.key] && assign[t.key] && autoBy[t.key]?.cat === assign[t.key]).length;
-          const canImport = includedCount > 0;
+          const credCount = credTx.filter((t) => credInclude[t.key]).length;
+          const canImport = includedCount > 0 || credCount > 0;
           return (
           <div className="imp-body">
             <div className="rev-summary">
@@ -2213,12 +2272,18 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
               })}
               {!visible.length && <div className="empty">No transactions match this filter.</div>}
             </div>
+            {stmtSummary && (
+              <div className="imp-readnote" style={{ background: "var(--teal-soft)", borderColor: "#BFE0D8", color: "var(--teal)" }}>
+                <Info size={14} /> Statement figures saved to Balances:{stmtSummary.balance != null ? ` closing balance ${money(stmtSummary.balance, sym)}` : ""}{stmtSummary.amountDue != null ? ` amount due ${money(stmtSummary.amountDue, sym)}` : ""}{stmtSummary.dueDate ? ` by ${stmtSummary.dueDate}` : ""}.
+              </div>
+            )}
+            <MoneyInReview items={credTx} kinds={credKinds} setKinds={setCredKinds} include={credInclude} setInclude={setCredInclude} dup={credDup} sym={sym} categories={categories} cats={credCats} setCats={setCredCats} />
             <label className="remember"><input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} /> Remember these merchant → category choices and pre-fill them next time</label>
             <div className="imp-actions">
               <button className="btn-ghost" onClick={() => setStep("map")}>Back</button>
               <button className="btn-add" disabled={!canImport} onClick={doImport}>
                 <Check size={16} /> {canImport
-                  ? `Save ${includedCount} expense${includedCount === 1 ? "" : "s"}${uncatCount ? ` (${uncatCount} to Suspense)` : ""}`
+                  ? `Save ${includedCount} expense${includedCount === 1 ? "" : "s"}${uncatCount ? ` (${uncatCount} to Suspense)` : ""}${credCount ? ` + ${credCount} credit${credCount === 1 ? "" : "s"}` : ""}`
                   : "Select transactions above"}
               </button>
             </div>
@@ -2391,12 +2456,13 @@ function Styles() {
 .stmt-item.done .stmt-check{background:var(--teal); border-color:var(--teal); color:#fff;}
 
 .entries{list-style:none; margin:0; padding:0; display:flex; flex-direction:column;}
-.entries li{display:grid; grid-template-columns:82px 1.05fr 120px 1.35fr auto 30px 30px; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid var(--hairline); font-size:13px;}
+.entries li{display:grid; grid-template-columns:82px 1.05fr 120px 1.35fr auto 58px 30px; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid var(--hairline); font-size:13px;}
 .entries li:last-child{border-bottom:0;}
 .en-date{font-size:12px; color:var(--muted);}
 .en-cat{font-weight:500;}
 .en-note{color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
 .en-amt{text-align:right; font-weight:600;}
+.en-btns{display:flex; gap:2px;}
 .en-del{border:0; background:transparent; color:var(--faint); cursor:pointer; display:grid; place-items:center; padding:5px; border-radius:7px;}
 .en-del:hover{color:var(--red); background:var(--red-soft);}
 .entries li.en-edit{display:grid; grid-template-columns:1.3fr .7fr .8fr .9fr 1fr auto; gap:8px; padding:10px 0; background:var(--bg); border-radius:10px; padding:10px 12px; margin:2px -12px;}
@@ -2540,7 +2606,7 @@ function Styles() {
   .grid{grid-template-columns:1fr;}
   .logform{grid-template-columns:1fr 1fr;}
   .logform .btn-add{grid-column:1 / -1;}
-  .entries li{grid-template-columns:60px 1fr 92px auto 28px 28px;}
+  .entries li{grid-template-columns:60px 1fr 92px auto 56px 28px;}
   .entries li.en-edit{grid-template-columns:1fr 1fr; row-gap:6px;}
   .en-edit-btns{grid-column:1/-1; justify-content:flex-start;}
   .en-note{display:none;}
@@ -2556,5 +2622,11 @@ function Styles() {
 .person-row{display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:4px;}
 .person-btn{border:1px solid var(--border);border-radius:12px;padding:2px 8px;font-size:11px;cursor:pointer;background:transparent;color:var(--ink);line-height:1.6;}
 .person-btn.on{background:var(--teal);color:#fff;border-color:var(--teal);}
+` + dashCss + incomeCss + featuresCss + `
+.cat-edit-wrap{border-bottom:1px solid var(--hairline); padding-bottom:6px; margin-bottom:6px;}
+.due-row{display:flex; align-items:center; flex-wrap:wrap; gap:6px; font-size:12px; color:var(--muted); padding:4px 0 2px 2px;}
+.due-row input{height:30px; border:1px solid var(--hairline); border-radius:8px; padding:0 8px; font:500 12.5px 'JetBrains Mono',monospace; background:var(--surface); color:var(--ink);}
 `}</style>);
 }
+
+export { money, moneySigned, monthLabel, shiftMonth, monthKey, budgetFor, mIdx, todayISO, uid, SECTIONS, NONSPEND_SECTION, SUSPENSE_ID, BANKS, BankOptions };
