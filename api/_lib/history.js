@@ -27,6 +27,10 @@ const KEY_LABELS = {
   "ledger:stmts": "statement checklist",
   "ledger:settings": "settings",
   "ledger:audit": "import log",
+  "ledger:credits": "money in",
+  "ledger:creditMap": "money-in memory",
+  "ledger:goals": "savings goals",
+  "ledger:balances": "balances",
 };
 
 export function emptyHistory() {

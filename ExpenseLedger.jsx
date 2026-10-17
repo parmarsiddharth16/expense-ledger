@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
 import {
   ChevronLeft, ChevronRight, Plus, Trash2, SlidersHorizontal, X,
   TriangleAlert, Check, Wallet, ArrowUpRight, Sparkles, Eye, EyeOff,
-  Upload, FileSpreadsheet, ArrowRight, Search, Info, BarChart2, Pencil, Download, LogOut
+  Upload, FileSpreadsheet, ArrowRight, Search, Info, BarChart2, Pencil, Download, LogOut, Scissors, Tag
 } from "lucide-react";
 import {
   ComposedChart, BarChart, Bar, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, Legend
@@ -10,15 +10,19 @@ import {
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
 import { merchantKey } from "./api/_lib/categorize.js";
+import { periodOf, currentPeriod, setMonthStart, getMonthStart, periodLabel } from "./src/period.js";
 import {
   useMonthFigures, KpiStrip, PaceCard, BillsCard, BudgetsCard, StructureCard,
   CashFlowCard, PayeesCard, SetAsideCard, QuickAdd, HistoryView, dashCss,
 } from "./src/dashboard.jsx";
 import {
-  classifyCredit, creditDupKey, MoneyInReview, IncomeView, incomeCss, monthIncome, dueDayOf, isBillCat, CREDIT_KINDS, ordinal,
+  classifyCredit, creditDupKey, MoneyInReview, IncomeView, incomeCss, monthIncome, dueDayOf, isBillCat, CREDIT_KINDS, ordinal, guessRefundCat,
 } from "./src/income.jsx";
+import {
+  DrillDown, computeAlerts, AlertsStrip, BalancesCard, GoalsCard, TagsView, SplitModal, CalendarView, AskView, featuresCss, parseTags,
+} from "./src/features.jsx";
 
-export const APP_VERSION = "2.1.0";
+export const APP_VERSION = "2.2.0";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -287,7 +291,7 @@ export async function logout() {
 }
 const K_CATS = "ledger:categories", K_EXP = "ledger:expenses", K_SET = "ledger:settings", K_INC = "ledger:income";
 const K_MAP = "ledger:merchantMap", K_STMTS = "ledger:stmts", K_AUDIT = "ledger:audit";
-const K_CREDITS = "ledger:credits", K_CMAP = "ledger:creditMap";
+const K_CREDITS = "ledger:credits", K_CMAP = "ledger:creditMap", K_GOALS = "ledger:goals", K_BAL = "ledger:balances";
 
 /* Transactions the categoriser would not guess at are parked under this id.
  * It deliberately isn't a real category, so the dashboard already rolls it into
@@ -345,7 +349,7 @@ export default function ExpenseLedger() {
   const [income, setIncome] = useState([]);
   const [expenses, setExpenses] = useState([]);
   const [sym, setSym] = useState("₹");
-  const [selMonth, setSelMonth] = useState(monthKey(new Date()));
+  const [selMonth, setSelMonth] = useState(currentPeriod());
   const [manageOpen, setManageOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
@@ -356,6 +360,12 @@ export default function ExpenseLedger() {
   const [credits, setCredits] = useState([]);
   const [creditMap, setCreditMap] = useState({});
   const [cardDue, setCardDue] = useState({});
+  const [goals, setGoals] = useState([]);
+  const [balances, setBalances] = useState({});
+  const [monthStart, setMonthStartState] = useState(1);
+  const [drill, setDrill] = useState(null);
+  const [splitting, setSplitting] = useState(null);
+  const [tagAll, setTagAll] = useState("");
   const [apiOpen, setApiOpen] = useState(false); // API reachable without a passcode
   const [sync, setSync] = useState("idle");
 
@@ -388,6 +398,8 @@ export default function ExpenseLedger() {
       const auditData = (await store.get(K_AUDIT)) || [];
       const creditData = (await store.get(K_CREDITS)) || [];
       const cmapData = (await store.get(K_CMAP)) || {};
+      const goalsData = (await store.get(K_GOALS)) || [];
+      const balData = (await store.get(K_BAL)) || {};
 
       if (ver !== CAT_VERSION || !cats || !cats.length) {
         const oldName = {};
@@ -426,6 +438,11 @@ export default function ExpenseLedger() {
       setCredits(creditData);
       setCreditMap(cmapData);
       setCardDue(settings.cardDue || {});
+      setGoals(goalsData);
+      setBalances(balData);
+      setMonthStart(settings.monthStart || 1);
+      setMonthStartState(settings.monthStart || 1);
+      setSelMonth(currentPeriod());
       setSym(settings.sym || "₹");
       setApiOpen(store.protectedRemote === false);
       setLoading(false);
@@ -441,17 +458,38 @@ export default function ExpenseLedger() {
 
   const saveCats = useCallback((n) => { setCategories(n); store.set(K_CATS, n); }, []);
   const saveExps = useCallback((n) => { setExpenses(n); store.set(K_EXP, n); }, []);
-  const saveSym = (s) => { setSym(s); store.set(K_SET, { sym: s, cardDue }); };
-  const saveCardDue = (n) => { setCardDue(n); store.set(K_SET, { sym, cardDue: n }); };
+  const settingsNow = { sym, cardDue, monthStart };
+  const saveSym = (s) => { setSym(s); store.set(K_SET, { ...settingsNow, sym: s }); };
+  const saveCardDue = (n) => { setCardDue(n); store.set(K_SET, { ...settingsNow, cardDue: n }); };
+  const saveMonthStart = (n) => {
+    const v = Math.min(28, Math.max(1, parseInt(n, 10) || 1));
+    setMonthStart(v); setMonthStartState(v); setSelMonth(currentPeriod());
+    store.set(K_SET, { ...settingsNow, monthStart: v });
+  };
+  const saveGoals = (n) => { setGoals(n); store.set(K_GOALS, n); };
+  const setBalance = (bank, entry) => {
+    const n = { ...balances, [bank]: [entry, ...(balances[bank] || [])].slice(0, 12) };
+    setBalances(n); store.set(K_BAL, n);
+  };
   const saveCredits = useCallback((n) => { setCredits(n); store.set(K_CREDITS, n); }, []);
   const saveStmts = useCallback((n) => { setStmts(n); store.set(K_STMTS, n); }, []);
   const saveAudit = useCallback((n) => { setAuditLog(n); store.set(K_AUDIT, n); }, []);
 
   /* ---- derived ---- */
   const catById = useMemo(() => { const m = {}; categories.forEach((c) => (m[c.id] = c)); return m; }, [categories]);
-  const monthExpenses = useMemo(() => expenses.filter((e) => e.date.slice(0, 7) === selMonth), [expenses, selMonth]);
+  /* Refunds set against a category count as negative spend there. They live in
+   * credits; these read-only rows let every total net them off. */
+  const allExp = useMemo(() => [
+    ...expenses,
+    ...credits.filter((c) => c.kind === "refund" && c.cat).map((c) => ({
+      id: "rf:" + c.id, creditId: c.id, cat: c.cat, amount: -c.amount, date: c.date,
+      note: "Refund · " + (c.note || ""), bank: c.bank, refund: true,
+    })),
+  ], [expenses, credits]);
+  const monthExpenses = useMemo(() => allExp.filter((e) => periodOf(e.date) === selMonth), [allExp, selMonth]);
   const spentByCat = useMemo(() => { const m = {}; monthExpenses.forEach((e) => (m[e.cat] = (m[e.cat] || 0) + e.amount)); return m; }, [monthExpenses]);
-  const fig = useMonthFigures({ expenses, categories, catById, selMonth });
+  const fig = useMonthFigures({ expenses: allExp, categories, catById, selMonth });
+  const alerts = useMemo(() => computeAlerts({ allExp, categories, catById, selMonth }), [allExp, categories, catById, selMonth]);
 
   const rows = useMemo(() => categories.map((c) => {
     const spent = spentByCat[c.id] || 0;
@@ -505,9 +543,11 @@ export default function ExpenseLedger() {
   const overRows = rows.filter((r) => r.status === "over" || r.status === "unbudgeted");
 
   /* ---- actions ---- */
-  const addExpense = ({ cat, amount, date, note, person = [], bank }) => {
+  const addExpense = ({ cat, amount, date, note, person = [], bank, tags }) => {
     if (!cat || !amount || amount <= 0 || !date) return;
     const entry = { id: uid(), cat, amount, date, note: note || "", src: "manual" };
+    const tg = parseTags(tags);
+    if (tg.length) entry.tags = tg;
     if (person.length) entry.person = person.join(",");
     if (bank) { entry.bank = bank; setLastBank(bank); try { localStorage.setItem("ledger:lastBank", bank); } catch {} }
     setExpenses((prev) => { const n = [entry, ...prev]; store.set(K_EXP, n); return n; });
@@ -518,7 +558,7 @@ export default function ExpenseLedger() {
         return next;
       });
     }
-    if (date.slice(0, 7) !== selMonth) setSelMonth(date.slice(0, 7));
+    if (periodOf(date) !== selMonth) setSelMonth(periodOf(date));
   };
   const delExpense = (id) => {
     const e = expenses.find((x) => x.id === id);
@@ -528,14 +568,14 @@ export default function ExpenseLedger() {
 
   const startEdit = (e) => {
     setEditingId(e.id);
-    setEditForm({ cat: e.cat, amount: String(e.amount), date: e.date, note: e.note || "", person: e.person || "", bank: e.bank || "" });
+    setEditForm({ cat: e.cat, amount: String(e.amount), date: e.date, note: e.note || "", person: e.person || "", bank: e.bank || "", tags: (e.tags || []).join(" ") });
   };
   const cancelEdit = () => setEditingId(null);
   const saveEdit = () => {
     const amt = parseFloat(editForm.amount);
     if (!editForm.cat || !amt || amt <= 0 || !editForm.date) return;
     saveExps(expenses.map((e) => e.id === editingId
-      ? { ...e, cat: editForm.cat, amount: amt, date: editForm.date, note: editForm.note.trim(), ...(editForm.person ? { person: editForm.person } : { person: undefined }), ...(editForm.bank ? { bank: editForm.bank } : { bank: undefined }) }
+      ? { ...e, cat: editForm.cat, amount: amt, date: editForm.date, note: editForm.note.trim(), ...(editForm.person ? { person: editForm.person } : { person: undefined }), ...(editForm.bank ? { bank: editForm.bank } : { bank: undefined }), tags: parseTags(editForm.tags).length ? parseTags(editForm.tags) : undefined }
       : e
     ));
     setEditingId(null);
@@ -553,6 +593,8 @@ export default function ExpenseLedger() {
         "ledger:stmts": stmts,
         "ledger:catPersonMap": catPersonMap,
         "ledger:credits": credits,
+        "ledger:goals": goals,
+        "ledger:balances": balances,
         "ledger:creditMap": creditMap,
         "ledger:catVersion": CAT_VERSION,
       };
@@ -607,19 +649,20 @@ export default function ExpenseLedger() {
     } catch { alert(text); }
   };
 
-  const onImport = (newExpenses, newMap, bankSource, audit, newCredits = []) => {
+  const onImport = (newExpenses, newMap, bankSource, audit, newCredits = [], summary = null) => {
+    if (summary && bankSource && (summary.balance != null || summary.amountDue != null)) setBalance(bankSource, { ...summary, src: "statement", at: new Date().toISOString() });
     if (newExpenses.length) saveExps([...newExpenses, ...expenses]);
     if (newCredits.length) saveCredits([...newCredits, ...credits]);
     if (newMap) { setMerchantMap(newMap); store.set(K_MAP, newMap); }
     const firstDate = newExpenses[0]?.date || newCredits[0]?.date;
     if (bankSource && firstDate) {
-      const mk = firstDate.slice(0, 7);
+      const mk = periodOf(firstDate);
       const cur = stmts[mk] || [];
       if (!cur.includes(bankSource)) saveStmts({ ...stmts, [mk]: [...cur, bankSource] });
     }
     if (audit) saveAudit([audit, ...auditLog].slice(0, 300));
     setImportOpen(false);
-    if (firstDate) setSelMonth(firstDate.slice(0, 7));
+    if (firstDate) setSelMonth(periodOf(firstDate));
     if (audit?.suspense) setView("suspense");
     else if (newCredits.some((c) => c.kind === "unsure")) setView("income");
   };
@@ -654,6 +697,21 @@ export default function ExpenseLedger() {
     }
   };
   const addCredit = (c) => saveCredits([c, ...credits]);
+  const setCreditCat = (id, cat) => saveCredits(credits.map((x) => (x.id === id ? { ...x, cat: cat || undefined } : x)));
+  /* Split one entry into several, one per category. The parts keep the date,
+   * note, account and tags, and remember which entry they came from. */
+  const splitEntry = (e, parts) => {
+    const pieces = parts.map((p, i) => ({ ...e, id: uid(), cat: p.cat, amount: p.amount, splitOf: e.id, note: e.note, prov: { layer: "manual", confidence: 1, reason: `split ${i + 1}/${parts.length}` } }));
+    const idx = expenses.findIndex((x) => x.id === e.id);
+    const next = expenses.slice(); next.splice(idx, 1, ...pieces);
+    saveExps(next); setSplitting(null);
+  };
+  const tagShown = (list, raw) => {
+    const tg = parseTags(raw); if (!tg.length) return;
+    const ids = new Set(list.filter((e) => !e.refund).map((e) => e.id));
+    saveExps(expenses.map((e) => (ids.has(e.id) ? { ...e, tags: [...new Set([...(e.tags || []), ...tg])] } : e)));
+    setTagAll("");
+  };
   const delCredit = (id) => {
     const c = credits.find((x) => x.id === id);
     if (c && !window.confirm(`Delete the credit of ${money(c.amount, sym)} on ${c.date}?`)) return;
@@ -684,10 +742,7 @@ export default function ExpenseLedger() {
   };
 
   /* Clicking a budget row shows that category's entries below. */
-  const pickBudgetRow = (r) => {
-    setEntrySearch(r.id === "__uncat__" ? "Uncategorised" : r.name);
-    setTimeout(() => entriesRef.current && entriesRef.current.scrollIntoView({ behavior: "smooth", block: "start" }), 30);
-  };
+  const pickBudgetRow = (r) => setDrill({ type: "cat", value: r.id, label: r.id === "__uncat__" ? "Uncategorised spend" : r.name });
 
   if (loading) return (<div className="ledger-root"><Styles /><div className="loading">Opening your ledger…</div></div>);
 
@@ -708,7 +763,7 @@ export default function ExpenseLedger() {
   const stmtDone = (stmts[selMonth] || []).filter((k) => STMT_BANKS.some((b) => b.key === k)).length;
   const selIdxLabel = monthLabel(selMonth);
   const tabs = [
-    ["dashboard", "Dashboard"], ["income", "Income"], ["analysis", "Analysis"],
+    ["dashboard", "Dashboard"], ["income", "Income"], ["calendar", "Calendar"], ["tags", "Trips & tags"], ["ask", "Ask"], ["analysis", "Analysis"],
     ["suspense", "Suspense"], ["history", "History"], ["audit", "Audit"],
   ];
 
@@ -738,7 +793,7 @@ export default function ExpenseLedger() {
         <div className="mast-actions">
           <div className="monthnav">
             <button aria-label="Previous month" onClick={() => setSelMonth(shiftMonth(selMonth, -1))}><ChevronLeft size={18} /></button>
-            <span className="monthnav-label">{selIdxLabel}</span>
+            <span className="monthnav-label">{periodLabel(selMonth)}</span>
             <button aria-label="Next month" onClick={() => setSelMonth(shiftMonth(selMonth, 1))}><ChevronRight size={18} /></button>
           </div>
           <button className={`btn-ghost stmt-badge ${stmtDone === STMT_BANKS.length ? "done" : "todo"}`} aria-expanded={stmtOpen} onClick={() => setStmtOpen((v) => !v)} title="Statements imported this month">
@@ -772,7 +827,7 @@ export default function ExpenseLedger() {
       )}
 
       {view === "analysis" ? (
-        <AnalysisView grouped={grouped} sym={sym} selMonth={selMonth} expenses={expenses} categories={categories} catById={catById} />
+        <AnalysisView grouped={grouped} sym={sym} selMonth={selMonth} expenses={allExp} categories={categories} catById={catById} />
       ) : view === "suspense" ? (
         <SuspenseView rows={suspenseRows} categories={categories} sym={sym} onClear={clearSuspense}
                       onDelete={(id) => saveExps(expenses.filter((e) => e.id !== id))} />
@@ -781,13 +836,20 @@ export default function ExpenseLedger() {
       ) : view === "history" ? (
         <HistoryView sym={sym} />
       ) : view === "income" ? (
-        <IncomeView credits={credits} selMonth={selMonth} sym={sym} onSetKind={setCreditKind} onAdd={addCredit} onDelete={delCredit} />
+        <IncomeView credits={credits} selMonth={selMonth} sym={sym} onSetKind={setCreditKind} onSetCat={setCreditCat} onAdd={addCredit} onDelete={delCredit} categories={categories} />
+      ) : view === "calendar" ? (
+        <CalendarView allExp={allExp} credits={credits} categories={categories} expenses={allExp} cardDue={cardDue} balances={balances} catById={catById} selMonth={selMonth} sym={sym} />
+      ) : view === "tags" ? (
+        <TagsView allExp={allExp} catById={catById} sym={sym} onOpen={(t) => setDrill({ type: "tag", value: t, label: t })} />
+      ) : view === "ask" ? (
+        <AskView />
       ) : (<>
       <KpiStrip fig={fig} mi={mi} sym={sym} selMonth={selMonth} />
+      <AlertsStrip alerts={alerts} sym={sym} onPick={(a) => setDrill(a.big ? { type: "merchant", value: merchantKey(a.name), label: a.name } : { type: "cat", value: a.id, label: a.name })} />
 
       <div className="cards">
         <PaceCard fig={fig} catById={catById} selMonth={selMonth} sym={sym} />
-        <BillsCard categories={categories} expenses={expenses} credits={credits} cardDue={cardDue} selMonth={selMonth} sym={sym} onSetDue={() => setManageOpen(true)} />
+        <BillsCard categories={categories} expenses={allExp} credits={credits} cardDue={cardDue} balances={balances} selMonth={selMonth} sym={sym} onSetDue={() => setManageOpen(true)} />
       </div>
       <div className="cards">
         <BudgetsCard fig={fig} categories={categories} catById={catById} selMonth={selMonth} sym={sym}
@@ -795,9 +857,13 @@ export default function ExpenseLedger() {
         <StructureCard fig={fig} catById={catById} sym={sym} />
       </div>
       <div className="cards">
-        <CashFlowCard expenses={expenses} credits={credits} categories={categories} cardDue={cardDue} catById={catById} selMonth={selMonth} sym={sym} />
-        <PayeesCard fig={fig} catById={catById} sym={sym} />
+        <CashFlowCard expenses={allExp} credits={credits} categories={categories} cardDue={cardDue} balances={balances} catById={catById} selMonth={selMonth} sym={sym} />
+        <PayeesCard fig={fig} catById={catById} sym={sym} onPick={setDrill} />
         <SetAsideCard categories={categories} selMonth={selMonth} sym={sym} />
+      </div>
+      <div className="cards">
+        <BalancesCard balances={balances} credits={credits} sym={sym} onSet={setBalance} />
+        <GoalsCard goals={goals} sym={sym} onSave={saveGoals} />
       </div>
 
       {/* entries */}
@@ -833,13 +899,21 @@ export default function ExpenseLedger() {
               bankLbl || "",
               e.person || "",
               String(e.amount),
+              ...(e.tags || []).map((t) => "#" + t),
             ].join(" ").toLowerCase();
-            return hay.includes(q);
+            return q.split(/\s+/).every((w) => hay.includes(w));
           });
           if (filtered.length === 0) {
             return <div className="empty">No entries match “{entrySearch}”.</div>;
           }
-          return (
+          return (<>
+          {q && (
+            <div className="tagall">
+              <Tag size={14} /> Tag all {filtered.filter((e) => !e.refund).length} shown as
+              <input value={tagAll} onChange={(ev) => setTagAll(ev.target.value)} placeholder="e.g. bangkok2026" onKeyDown={(ev) => ev.key === "Enter" && tagShown(filtered, tagAll)} aria-label="Tag to add" />
+              <button className="btn-ghost sm" disabled={!tagAll.trim()} onClick={() => tagShown(filtered, tagAll)}>Add tag</button>
+            </div>
+          )}
           <ul className="entries">
             {filtered.slice().sort((a, b) => b.date.localeCompare(a.date)).map((e) => {
               if (editingId === e.id) {
@@ -862,6 +936,7 @@ export default function ExpenseLedger() {
                       <BankOptions />
                     </select>
                     <input className="en-edit-note" type="text" placeholder="Note" value={editForm.note} onChange={(ev) => setEditForm({ ...editForm, note: ev.target.value })} onKeyDown={(ev) => ev.key === "Enter" && saveEdit()} />
+                    <input className="en-edit-note" type="text" placeholder="Tags, e.g. diwali bangkok2026" value={editForm.tags || ""} onChange={(ev) => setEditForm({ ...editForm, tags: ev.target.value })} onKeyDown={(ev) => ev.key === "Enter" && saveEdit()} aria-label="Tags" />
                     <div className="en-edit-btns">
                       <button className="icon-btn" aria-label="Save" onClick={saveEdit}><Check size={14} strokeWidth={2.5} style={{ color: "var(--teal)" }} /></button>
                       <button className="icon-btn" aria-label="Cancel" onClick={cancelEdit}><X size={14} /></button>
@@ -870,19 +945,26 @@ export default function ExpenseLedger() {
                 );
               }
               return (
-                <li key={e.id}>
+                <li key={e.id} className={e.refund ? "en-refund" : ""}>
                   <span className="en-date num">{e.date.slice(8, 10)} {monthLabel(e.date.slice(0, 7), { month: "short" })}</span>
                   <span className="en-cat">{catById[e.cat]?.name || "Uncategorised"}</span>
                   <span className="en-bank">{BANKS.find(b => b.key === e.bank)?.label || (e.src === "import" ? e.bank : "—")}</span>
-                  <span className="en-note">{e.note || "—"}{e.person && e.person.split(",").map((p) => <span key={p} className="person-tag">{p}</span>)}</span>
-                  <span className="en-amt num">{money(e.amount, sym)}</span>
-                  <button className="en-del" aria-label="Edit entry" onClick={() => startEdit(e)}><Pencil size={13} /></button>
-                  <button className="en-del" aria-label="Delete entry" onClick={() => delExpense(e.id)}><Trash2 size={14} /></button>
+                  <span className="en-note">{e.note || "—"}{e.splitOf && <span className="en-split">split</span>}{e.person && e.person.split(",").map((p) => <span key={p} className="person-tag">{p}</span>)}{(e.tags || []).map((t) => <button key={t} type="button" className="tag-chip" style={{ border: 0, cursor: "pointer" }} onClick={() => setDrill({ type: "tag", value: t, label: t })}>#{t}</button>)}</span>
+                  <span className="en-amt num">{moneySigned(e.amount, sym)}</span>
+                  {e.refund ? (
+                    <span className="en-del" title="A refund — change it in the Income tab" style={{ gridColumn: "span 2", fontSize: 10.5, fontWeight: 600, color: "var(--teal)", width: "auto" }}>refund</span>
+                  ) : (<>
+                    <span className="en-btns">
+                      <button className="en-del" aria-label="Split entry across categories" title="Split across categories" onClick={() => setSplitting(e)}><Scissors size={13} /></button>
+                      <button className="en-del" aria-label="Edit entry" onClick={() => startEdit(e)}><Pencil size={13} /></button>
+                    </span>
+                    <button className="en-del" aria-label="Delete entry" onClick={() => delExpense(e.id)}><Trash2 size={14} /></button>
+                  </>)}
                 </li>
               );
             })}
           </ul>
-          );
+          </>);
         })()}
       </section>
       </>)}
@@ -890,6 +972,9 @@ export default function ExpenseLedger() {
       <button className="fab" onClick={() => setQuickOpen(true)} aria-label="Add expense">
         <Plus size={22} strokeWidth={2.5} /> <span className="fab-label">Add expense</span>
       </button>
+
+      {drill && <DrillDown filter={drill} allExp={allExp} catById={catById} sym={sym} onClose={() => setDrill(null)} />}
+      {splitting && <SplitModal entry={splitting} categories={categories} sym={sym} onClose={() => setSplitting(null)} onSave={(parts) => splitEntry(splitting, parts)} />}
 
       {quickOpen && (
         <QuickAdd categories={categories} expenses={expenses} catPersonMap={catPersonMap} defaultBank={lastBank} sym={sym}
@@ -917,6 +1002,13 @@ export default function ExpenseLedger() {
             </div>
             <p className="drawer-hint">Editing amounts for <strong>{selIdxLabel}</strong>. Flat budgets update every month; budgets that vary month-to-month update just this one.</p>
 
+            <div className="cur-row">
+              <span>Month starts on day</span>
+              <span className="ms-row" style={{ padding: 0 }}>
+                <input type="number" min="1" max="28" value={monthStart} onChange={(e) => saveMonthStart(e.target.value)} aria-label="Month starts on day" />
+                <span style={{ fontSize: 12, color: "var(--muted)" }}>{monthStart === 1 ? "calendar months" : `e.g. this month = ${periodLabel(currentPeriod())}`}</span>
+              </span>
+            </div>
             <div className="cur-row">
               <span>Currency</span>
               <div className="cur-pills">{CURRENCIES.map((c) => (<button key={c} className={c === sym ? "cur on" : "cur"} onClick={() => saveSym(c)}>{c.trim()}</button>))}</div>
@@ -1008,7 +1100,7 @@ function AnalysisView({ grouped, sym, selMonth, expenses = [], categories = [], 
   const spendExp = useMemo(() => expenses.filter((e) => !nonSpend(e.cat)), [expenses, catById]);
   const spendCats = useMemo(() => categories.filter((c) => c.section !== NONSPEND_SECTION), [categories]);
   const monthExp = useMemo(
-    () => spendExp.filter((e) => e.date.slice(0, 7) === selMonth),
+    () => spendExp.filter((e) => periodOf(e.date) === selMonth),
     [spendExp, selMonth]
   );
 
@@ -1051,7 +1143,7 @@ function AnalysisView({ grouped, sym, selMonth, expenses = [], categories = [], 
     return keys.map((k) => ({
       key: k,
       name: monthLabel(k, { month: "short" }),
-      spent: Math.round(spendExp.filter((e) => e.date.slice(0, 7) === k).reduce((s, e) => s + e.amount, 0)),
+      spent: Math.round(spendExp.filter((e) => periodOf(e.date) === k).reduce((s, e) => s + e.amount, 0)),
       budget: Math.round(spendCats.reduce((s, c) => s + budgetFor(c, k), 0)),
     }));
   }, [spendExp, spendCats]);
@@ -1210,7 +1302,7 @@ function CategoryMoM({ expenses, categories, catById, selMonth, sym }) {
     const spent = {}; // catId -> monthKey -> amt
     const inFYk = new Set(keys);
     expenses.forEach((e) => {
-      const k = e.date.slice(0, 7);
+      const k = periodOf(e.date);
       if (!inFYk.has(k)) return;
       const id = catById[e.cat] ? e.cat : "__uncat__";
       if (!spent[id]) spent[id] = {};
@@ -1580,17 +1672,20 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
   const [credKinds, setCredKinds] = useState({});
   const [credInclude, setCredInclude] = useState({});
   const [credDup, setCredDup] = useState({});
+  const [credCats, setCredCats] = useState({});
+  const [stmtSummary, setStmtSummary] = useState(null);
   const existingCreditKeys = useMemo(() => new Set(existingCredits.map(creditDupKey)), [existingCredits]);
   const stageCredits = (list, bank) => {
-    const k = {}, inc = {}, dp = {};
+    const k = {}, inc = {}, dp = {}, cc = {};
     const out = list.map((t, i) => {
       const key = "c" + i;
       const cls = classifyCredit({ ...t, bank }, { creditMap, expenses: existing || [] });
+      if (cls.kind === "refund") cc[key] = guessRefundCat(t.desc, existing);
       const isDup = existingCreditKeys.has(creditDupKey({ ...t, note: t.desc, bank }));
       k[key] = cls.kind; inc[key] = !isDup; dp[key] = isDup;
       return { ...t, key, reason: cls.reason };
     });
-    setCredTx(out); setCredKinds(k); setCredInclude(inc); setCredDup(dp);
+    setCredTx(out); setCredKinds(k); setCredInclude(inc); setCredDup(dp); setCredCats(cc);
   };
   const dupKey = (date, amount, desc) => `${date}|${Math.round(amount)}|${normMerchant(desc)}`;
   const existingKeys = useMemo(() => new Set((existing || []).map((e) => dupKey(e.date, e.amount, e.note))), [existing]);
@@ -1701,6 +1796,25 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
         return;
       }
       stageCredits(creds.map((t) => ({ date: t.date, desc: t.description, amount: t.amount })), bank);
+      // Statement figures for the balances card: closing balance = the last
+      // running balance in the statement; card dues come from the summary box.
+      {
+        const withBal = (ex.transactions || []).filter((t) => t.balance != null && !isNaN(t.balance));
+        const last = withBal.length ? withBal.reduce((a, t) => (t.date >= a.date ? t : a), withBal[0]) : null;
+        const sm = ex.summary || {};
+        const isCard = BANKS.find((b) => b.key === bank)?.mode === "card";
+        const lastDate = (ex.transactions || []).reduce((m, t) => (t.date > m ? t.date : m), "");
+        const summary = {
+          asOf: sm.statementDate || (last && last.date) || lastDate || null,
+          ...(isCard ? {} : { balance: sm.closingBalance ?? (last ? last.balance : null) }),
+          ...(sm.amountDue != null ? { amountDue: sm.amountDue } : {}),
+          ...(sm.minDue != null ? { minDue: sm.minDue } : {}),
+          ...(sm.dueDate ? { dueDate: sm.dueDate } : {}),
+          ...(sm.statementDate ? { statementDate: sm.statementDate } : {}),
+          file: file.name,
+        };
+        setStmtSummary(summary.balance != null || summary.amountDue != null ? summary : null);
+      }
 
       setProgress(`Categorising ${debits.length} transactions…`);
       let results = [];
@@ -1799,6 +1913,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
     const newCredits = pickedCredits.map((t) => ({
       id: uid(), date: t.date, amount: t.amount, note: t.desc || "Credit", bank: bankSource,
       kind: credKinds[t.key], src: "import", prov: credKinds[t.key] === "unsure" ? "unsure" : "auto",
+      ...(credKinds[t.key] === "refund" && credCats[t.key] ? { cat: credCats[t.key] } : {}),
     }));
 
     const expenses = picked.map((t) => {
@@ -1858,7 +1973,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
       categoriser: catSummary || null,
     };
 
-    onImport(expenses, newMap, bankSource, audit, newCredits);
+    onImport(expenses, newMap, bankSource, audit, newCredits, stmtSummary);
   };
 
   return (
@@ -2157,7 +2272,12 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
               })}
               {!visible.length && <div className="empty">No transactions match this filter.</div>}
             </div>
-            <MoneyInReview items={credTx} kinds={credKinds} setKinds={setCredKinds} include={credInclude} setInclude={setCredInclude} dup={credDup} sym={sym} />
+            {stmtSummary && (
+              <div className="imp-readnote" style={{ background: "var(--teal-soft)", borderColor: "#BFE0D8", color: "var(--teal)" }}>
+                <Info size={14} /> Statement figures saved to Balances:{stmtSummary.balance != null ? ` closing balance ${money(stmtSummary.balance, sym)}` : ""}{stmtSummary.amountDue != null ? ` amount due ${money(stmtSummary.amountDue, sym)}` : ""}{stmtSummary.dueDate ? ` by ${stmtSummary.dueDate}` : ""}.
+              </div>
+            )}
+            <MoneyInReview items={credTx} kinds={credKinds} setKinds={setCredKinds} include={credInclude} setInclude={setCredInclude} dup={credDup} sym={sym} categories={categories} cats={credCats} setCats={setCredCats} />
             <label className="remember"><input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} /> Remember these merchant → category choices and pre-fill them next time</label>
             <div className="imp-actions">
               <button className="btn-ghost" onClick={() => setStep("map")}>Back</button>
@@ -2336,12 +2456,13 @@ function Styles() {
 .stmt-item.done .stmt-check{background:var(--teal); border-color:var(--teal); color:#fff;}
 
 .entries{list-style:none; margin:0; padding:0; display:flex; flex-direction:column;}
-.entries li{display:grid; grid-template-columns:82px 1.05fr 120px 1.35fr auto 30px 30px; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid var(--hairline); font-size:13px;}
+.entries li{display:grid; grid-template-columns:82px 1.05fr 120px 1.35fr auto 58px 30px; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid var(--hairline); font-size:13px;}
 .entries li:last-child{border-bottom:0;}
 .en-date{font-size:12px; color:var(--muted);}
 .en-cat{font-weight:500;}
 .en-note{color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
 .en-amt{text-align:right; font-weight:600;}
+.en-btns{display:flex; gap:2px;}
 .en-del{border:0; background:transparent; color:var(--faint); cursor:pointer; display:grid; place-items:center; padding:5px; border-radius:7px;}
 .en-del:hover{color:var(--red); background:var(--red-soft);}
 .entries li.en-edit{display:grid; grid-template-columns:1.3fr .7fr .8fr .9fr 1fr auto; gap:8px; padding:10px 0; background:var(--bg); border-radius:10px; padding:10px 12px; margin:2px -12px;}
@@ -2485,7 +2606,7 @@ function Styles() {
   .grid{grid-template-columns:1fr;}
   .logform{grid-template-columns:1fr 1fr;}
   .logform .btn-add{grid-column:1 / -1;}
-  .entries li{grid-template-columns:60px 1fr 92px auto 28px 28px;}
+  .entries li{grid-template-columns:60px 1fr 92px auto 56px 28px;}
   .entries li.en-edit{grid-template-columns:1fr 1fr; row-gap:6px;}
   .en-edit-btns{grid-column:1/-1; justify-content:flex-start;}
   .en-note{display:none;}
@@ -2501,7 +2622,7 @@ function Styles() {
 .person-row{display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:4px;}
 .person-btn{border:1px solid var(--border);border-radius:12px;padding:2px 8px;font-size:11px;cursor:pointer;background:transparent;color:var(--ink);line-height:1.6;}
 .person-btn.on{background:var(--teal);color:#fff;border-color:var(--teal);}
-` + dashCss + incomeCss + `
+` + dashCss + incomeCss + featuresCss + `
 .cat-edit-wrap{border-bottom:1px solid var(--hairline); padding-bottom:6px; margin-bottom:6px;}
 .due-row{display:flex; align-items:center; flex-wrap:wrap; gap:6px; font-size:12px; color:var(--muted); padding:4px 0 2px 2px;}
 .due-row input{height:30px; border:1px solid var(--hairline); border-radius:8px; padding:0 8px; font:500 12.5px 'JetBrains Mono',monospace; background:var(--surface); color:var(--ink);}

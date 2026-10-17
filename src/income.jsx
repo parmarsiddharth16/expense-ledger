@@ -4,6 +4,7 @@ import {
   money, monthLabel, shiftMonth, monthKey, budgetFor, uid, BANKS, NONSPEND_SECTION,
 } from "../ExpenseLedger.jsx";
 import { merchantKey } from "../api/_lib/categorize.js";
+import { periodOf, currentPeriod, dateOnDay, periodLabel } from "./period.js";
 
 /*
  * Money in.
@@ -69,7 +70,7 @@ export function classifyCredit(t, { creditMap = {}, expenses = [] } = {}) {
 export function monthIncome(credits, k) {
   const out = { total: 0, byKind: {}, unsure: 0, unsureAmt: 0, n: 0, has: false };
   for (const c of credits || []) {
-    if (!c.date || c.date.slice(0, 7) !== k) continue;
+    if (!c.date || periodOf(c.date) !== k) continue;
     out.has = true;
     out.byKind[c.kind] = (out.byKind[c.kind] || 0) + c.amount;
     if (isIncome(c.kind)) { out.total += c.amount; out.n += 1; }
@@ -95,7 +96,7 @@ export const isBillCat = (c) => c && BILL_SECTIONS.includes(c.section) && !NOT_A
 
 /** The day of the month a category is usually paid: median over its last 6 months of entries. */
 export function inferDueDay(catId, expenses) {
-  const since = shiftMonth(monthKey(new Date()), -6);
+  const since = shiftMonth(currentPeriod(), -6);
   const byMonth = {};
   for (const e of expenses) {
     if (e.cat !== catId || e.date.slice(0, 7) < since) continue;
@@ -117,11 +118,11 @@ const isoOf = (k, d) => `${k}-${String(clampDay(k, d)).padStart(2, "0")}`;
  * spend on that card, and it counts as paid once a card-payment credit for
  * that card is recorded in the month.
  */
-export function billsForMonth({ categories, expenses, credits = [], cardDue = {}, selMonth }) {
+export function billsForMonth({ categories, expenses, credits = [], cardDue = {}, balances = {}, selMonth }) {
   const today = new Date();
   const todayIso = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
   const spentBy = {};
-  for (const e of expenses) if (e.date.slice(0, 7) === selMonth) spentBy[e.cat] = (spentBy[e.cat] || 0) + e.amount;
+  for (const e of expenses) if (periodOf(e.date) === selMonth) spentBy[e.cat] = (spentBy[e.cat] || 0) + e.amount;
 
   const status = (paidAmt, due, date) => {
     if (paidAmt >= due * 0.9) return "paid";
@@ -138,28 +139,51 @@ export function billsForMonth({ categories, expenses, credits = [], cardDue = {}
     const due = budgetFor(c, selMonth);
     if (due <= 0) continue;
     const dd = dueDayOf(c, expenses);
-    const date = dd ? isoOf(selMonth, dd.day) : null;
+    const date = dd ? dateOnDay(selMonth, dd.day) : null;
     const paid = spentBy[c.id] || 0;
     out.push({ id: c.id, name: c.name, section: c.section, due, paid, date, inferred: dd?.inferred, kind: "bill", status: status(paid, due, date) });
   }
   const prev = shiftMonth(selMonth, -1);
   for (const b of BANKS.filter((x) => x.mode === "card")) {
+    // A statement that states its own due date in this month beats any estimate.
+    const st = (balances[b.key] || []).find((x) => x.dueDate && periodOf(x.dueDate) === selMonth && x.amountDue != null);
+    if (st) {
+      const paid = credits.filter((c) => c.bank === b.key && c.kind === "card_payment" && c.date >= (st.statementDate || st.asOf || "0")).reduce((s, c) => s + c.amount, 0);
+      out.push({ id: "card:" + b.key, name: `${b.label} bill`, section: `from statement${st.minDue ? ` · min ${money(st.minDue, "₹")}` : ""}`, due: st.amountDue, paid, date: st.dueDate, kind: "card", status: status(paid, st.amountDue, st.dueDate) });
+      continue;
+    }
     const day = cardDue[b.key];
     if (!day) continue;
-    const due = expenses.filter((e) => e.bank === b.key && e.date.slice(0, 7) === prev).reduce((s, e) => s + e.amount, 0);
+    const due = expenses.filter((e) => e.bank === b.key && periodOf(e.date) === prev).reduce((s, e) => s + e.amount, 0);
     if (due <= 0) continue;
-    const paid = credits.filter((c) => c.bank === b.key && c.kind === "card_payment" && c.date.slice(0, 7) === selMonth).reduce((s, c) => s + c.amount, 0);
-    const date = isoOf(selMonth, day);
+    const paid = credits.filter((c) => c.bank === b.key && c.kind === "card_payment" && periodOf(c.date) === selMonth).reduce((s, c) => s + c.amount, 0);
+    const date = dateOnDay(selMonth, day);
     out.push({ id: "card:" + b.key, name: `${b.label} bill`, section: `${monthLabel(prev, { month: "short" })} card spend`, due, paid, date, kind: "card", status: status(paid, due, date) });
   }
   const rank = { overdue: 0, soon: 1, part: 2, upcoming: 3, nodate: 4, paid: 5 };
   return out.sort((a, b) => rank[a.status] - rank[b.status] || (a.date || "9").localeCompare(b.date || "9") || b.due - a.due);
 }
 
+/** A refund can be set against the category it came back to, which lowers that category's spend. */
+export function RefundCat({ categories, value, onChange }) {
+  return (
+    <select className="kind-sel" value={value} onChange={(e) => onChange(e.target.value)} aria-label="Refund against which category">
+      <option value="">Refund for… (lowers that spend)</option>
+      {categories.filter((c) => c.section !== NONSPEND_SECTION).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+    </select>
+  );
+}
+export function guessRefundCat(desc, expenses) {
+  const k = merchantKey(desc || "");
+  if (!k) return "";
+  const hit = (expenses || []).filter((e) => merchantKey(e.note || "") === k).sort((a, b) => b.date.localeCompare(a.date))[0];
+  return hit ? hit.cat : "";
+}
+
 /* ------------------------------------------------------------------ */
 /*  Import step: the credits found in a statement                      */
 /* ------------------------------------------------------------------ */
-export function MoneyInReview({ items, kinds, setKinds, include, setInclude, dup, sym }) {
+export function MoneyInReview({ items, kinds, setKinds, include, setInclude, dup, sym, categories = [], cats = {}, setCats = () => {} }) {
   const [open, setOpen] = useState(true);
   if (!items.length) return null;
   const counted = items.filter((t) => include[t.key] && isIncome(kinds[t.key])).reduce((s, t) => s + t.amount, 0);
@@ -180,9 +204,12 @@ export function MoneyInReview({ items, kinds, setKinds, include, setInclude, dup
                 <span className="rev-desc">{t.desc || "—"}{dup[t.key] && <span className="dupbadge">already recorded?</span>}</span>
                 <span className="rev-meta num">{t.date || "no date"} · <span className="t-teal">+{money(t.amount, sym)}</span> · {t.reason}</span>
               </div>
-              <select className={`kind-sel k-${kinds[t.key]}`} value={kinds[t.key]} onChange={(e) => setKinds({ ...kinds, [t.key]: e.target.value })} aria-label="What is this credit">
-                {KIND_ORDER.map((k) => <option key={k} value={k}>{CREDIT_KINDS[k].label}</option>)}
-              </select>
+              <span style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <select className={`kind-sel k-${kinds[t.key]}`} value={kinds[t.key]} onChange={(e) => setKinds({ ...kinds, [t.key]: e.target.value })} aria-label="What is this credit">
+                  {KIND_ORDER.map((k) => <option key={k} value={k}>{CREDIT_KINDS[k].label}</option>)}
+                </select>
+                {kinds[t.key] === "refund" && <RefundCat categories={categories} value={cats[t.key] || ""} onChange={(v) => setCats({ ...cats, [t.key]: v })} />}
+              </span>
             </div>
           ))}
         </div>
@@ -194,12 +221,12 @@ export function MoneyInReview({ items, kinds, setKinds, include, setInclude, dup
 /* ------------------------------------------------------------------ */
 /*  Income tab                                                         */
 /* ------------------------------------------------------------------ */
-export function IncomeView({ credits, selMonth, sym, onSetKind, onAdd, onDelete }) {
+export function IncomeView({ credits, selMonth, sym, onSetKind, onSetCat, onAdd, onDelete, categories = [] }) {
   const [q, setQ] = useState("");
   const [showAll, setShowAll] = useState(false);
   const [form, setForm] = useState({ date: `${selMonth}-01`, amount: "", note: "", kind: "other_income", bank: "cash" });
   const mi = monthIncome(credits, selMonth);
-  const rows = credits.filter((c) => c.date.slice(0, 7) === selMonth)
+  const rows = credits.filter((c) => periodOf(c.date) === selMonth)
     .filter((c) => showAll || c.kind !== "card_payment")
     .filter((c) => !q || (c.note || "").toLowerCase().includes(q.toLowerCase()))
     .sort((a, b) => (a.kind === "unsure" ? -1 : 0) - (b.kind === "unsure" ? -1 : 0) || b.date.localeCompare(a.date));
@@ -212,7 +239,7 @@ export function IncomeView({ credits, selMonth, sym, onSetKind, onAdd, onDelete 
     <div className="hist-wrap">
       <section className="panel">
         <div className="card-head">
-          <h2>Money in · {monthLabel(selMonth)}</h2>
+          <h2>Money in · {periodLabel(selMonth)}</h2>
           <span className="card-meta">{salaryDay ? `Salary usually arrives around the ${ordinal(salaryDay)}` : ""}</span>
         </div>
         {!mi.has ? (
@@ -237,9 +264,12 @@ export function IncomeView({ credits, selMonth, sym, onSetKind, onAdd, onDelete 
               <li key={c.id} className={c.kind === "unsure" ? "unsure" : ""}>
                 <span className="num cl-date">{c.date.slice(8, 10)} {monthLabel(c.date.slice(0, 7), { month: "short" })}</span>
                 <span className="cl-main"><span className="cl-note">{c.note || "—"}</span><span className="cl-bank">{BANKS.find((b) => b.key === c.bank)?.label || c.bank || "—"}</span></span>
-                <select className={`kind-sel k-${c.kind}`} value={c.kind} onChange={(e) => onSetKind(c.id, e.target.value)} aria-label="What is this credit">
-                  {KIND_ORDER.map((k) => <option key={k} value={k}>{CREDIT_KINDS[k].label}</option>)}
-                </select>
+                <span style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <select className={`kind-sel k-${c.kind}`} value={c.kind} onChange={(e) => onSetKind(c.id, e.target.value)} aria-label="What is this credit">
+                    {KIND_ORDER.map((k) => <option key={k} value={k}>{CREDIT_KINDS[k].label}</option>)}
+                  </select>
+                  {c.kind === "refund" && <RefundCat categories={categories} value={c.cat || ""} onChange={(v) => onSetCat(c.id, v)} />}
+                </span>
                 <span className={`num cl-amt ${isIncome(c.kind) ? "t-teal" : ""}`}>+{money(c.amount, sym)}</span>
                 <button className="en-del" aria-label="Delete credit" onClick={() => onDelete(c.id)}>×</button>
               </li>

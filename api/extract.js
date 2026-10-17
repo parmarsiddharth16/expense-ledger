@@ -2,6 +2,7 @@ import { extractLines, PasswordError } from "./_lib/pdftext.js";
 import { parseStatement } from "./_lib/parse.js";
 import { requirePasscode } from "./_lib/auth.js";
 import { readJsonBody } from "./_lib/blob.js";
+import { summarizeStatement } from "./_lib/summary.js";
 import { askClaude } from "./_lib/ai.js";
 import { sniff, isSheetKind, parseSpreadsheet, rowsToCSV } from "./_lib/sheet.js";
 
@@ -145,6 +146,7 @@ export default async function handler(req, res) {
         ms: Date.now() - t0,
         aiError,
       },
+      summary: (() => { try { return summarizeStatement(lines.map((l) => l.text)); } catch { return {}; } })(),
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String((e && e.message) || e) });

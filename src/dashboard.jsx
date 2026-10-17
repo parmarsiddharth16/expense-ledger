@@ -7,6 +7,7 @@ import {
   SECTIONS, NONSPEND_SECTION, SUSPENSE_ID, BANKS, BankOptions, api, store,
 } from "../ExpenseLedger.jsx";
 import { merchantKey } from "../api/_lib/categorize.js";
+import { periodOf, currentPeriod, periodDays, periodRange, dayIndex, todayIso, periodDates, shortDate } from "./period.js";
 import { billsForMonth, monthIncome, typicalDay, ordinal, CREDIT_KINDS, isIncome, BILL_SECTIONS, NOT_A_BILL } from "./income.jsx";
 
 /*
@@ -43,7 +44,7 @@ const titleCase = (s) => s.toLowerCase().replace(/\b[a-z]/g, (c) => c.toUpperCas
 export function useMonthFigures({ expenses, categories, catById, selMonth }) {
   return useMemo(() => {
     const isSpend = (e) => catById[e.cat]?.section !== NONSPEND_SECTION;
-    const month = expenses.filter((e) => e.date.slice(0, 7) === selMonth && isSpend(e));
+    const month = expenses.filter((e) => periodOf(e.date) === selMonth && isSpend(e));
     const spentBy = {};
     month.forEach((e) => { spentBy[e.cat] = (spentBy[e.cat] || 0) + e.amount; });
     const spendCats = categories.filter((c) => c.section !== NONSPEND_SECTION);
@@ -58,9 +59,9 @@ export function useMonthFigures({ expenses, categories, catById, selMonth }) {
 /* ------------------------------------------------------------------ */
 export function KpiStrip({ fig, mi, sym, selMonth }) {
   const today = new Date();
-  const cur = monthKey(today);
+  const cur = currentPeriod();
   const left = fig.budget - fig.spent;
-  const daysLeft = selMonth === cur ? daysIn(selMonth) - today.getDate() + 1 : 0;
+  const daysLeft = selMonth === cur ? periodDays(selMonth) - dayIndex(todayIso(), selMonth) + 1 : 0;
   const pct = fig.budget > 0 ? Math.round((fig.spent / fig.budget) * 100) : 0;
   const net = mi.total - fig.spent;
   const rate = mi.total > 0 ? Math.round((net / mi.total) * 100) : 0;
@@ -93,13 +94,14 @@ export function KpiStrip({ fig, mi, sym, selMonth }) {
 /* ------------------------------------------------------------------ */
 export function PaceCard({ fig, catById, selMonth, sym }) {
   const today = new Date();
-  const cur = monthKey(today);
-  const N = daysIn(selMonth);
+  const cur = currentPeriod();
+  const N = periodDays(selMonth);
   const isCur = selMonth === cur, isPast = selMonth < cur;
-  const dayN = isCur ? today.getDate() : isPast ? N : 0;
+  const dayN = isCur ? dayIndex(todayIso(), selMonth) : isPast ? N : 0;
+  const range = periodRange(selMonth);
 
   const daily = Array(N).fill(0);
-  fig.month.forEach((e) => { const d = Number(e.date.slice(8, 10)); if (d >= 1 && d <= N) daily[d - 1] += e.amount; });
+  fig.month.forEach((e) => { const d = dayIndex(e.date, selMonth); if (d >= 1 && d <= N) daily[d - 1] += e.amount; });
   const cum = []; daily.reduce((s, v, i) => (cum[i] = s + v), 0);
 
   // Forecast: bills still to be paid this month + day-to-day spend at today's pace.
@@ -166,8 +168,8 @@ export function PaceCard({ fig, catById, selMonth, sym }) {
           <circle cx={lastX} cy={lastY} r="5" fill="var(--teal)" stroke="#fff" strokeWidth="2" />
           <text x={Math.min(lastX + 9, R - 90)} y={Math.min(lastY + 16, B - 6)} className="svg-val">{shortAmt(cum[dayN - 1], sym)}{isCur ? " today" : ""}</text>
         </>}
-        <text x={L} y={H - 4} className="svg-lbl">1 {monthLabel(selMonth, { month: "short" })}</text>
-        <text x={R - 44} y={H - 4} className="svg-lbl">{N} {monthLabel(selMonth, { month: "short" })}</text>
+        <text x={L} y={H - 4} className="svg-lbl">{shortDate(range.start)}</text>
+        <text x={R - 44} y={H - 4} className="svg-lbl">{shortDate(range.end)}</text>
       </svg>
       {isCur && today.getDate() < 25 && (
         <p className="card-note">Card and bank statements usually land after the 22nd, so this month's picture fills in once they're imported.</p>
@@ -179,8 +181,8 @@ export function PaceCard({ fig, catById, selMonth, sym }) {
 /* ------------------------------------------------------------------ */
 /*  Bills this month                                                   */
 /* ------------------------------------------------------------------ */
-export function BillsCard({ categories, expenses, credits, cardDue, selMonth, sym, onSetDue }) {
-  const bills = billsForMonth({ categories, expenses, credits, cardDue, selMonth });
+export function BillsCard({ categories, expenses, credits, cardDue, balances, selMonth, sym, onSetDue }) {
+  const bills = billsForMonth({ categories, expenses, credits, cardDue, balances, selMonth });
   const total = bills.reduce((s, b) => s + b.due, 0);
   const left = bills.reduce((s, b) => s + Math.max(0, b.due - b.paid), 0);
   const overdue = bills.filter((b) => b.status === "overdue");
@@ -223,7 +225,7 @@ export function BillsCard({ categories, expenses, credits, cardDue, selMonth, sy
             <li key={b.id} className={b.status === "overdue" ? "is-overdue" : ""}>
               <span className={`bill-date ${b.status}`} title={b.date ? (b.inferred ? "Due day worked out from when you've paid it before — set it in Budgets" : "Due day you set") : "Set a due day in Budgets"}>
                 <strong>{b.date ? Number(b.date.slice(8, 10)) : "—"}</strong>
-                <span>{monthLabel(selMonth, { month: "short" })}{b.inferred ? "*" : ""}</span>
+                <span>{b.date ? new Date(b.date + "T00:00:00").toLocaleDateString("en-US", { month: "short" }) : ""}{b.inferred ? "*" : ""}</span>
               </span>
               <span className="bill-main">
                 <span className="bill-name">{b.name}</span>
@@ -349,23 +351,23 @@ export function StructureCard({ fig, catById, sym }) {
 /* ------------------------------------------------------------------ */
 /*  Cash flow — last 6 months                                          */
 /* ------------------------------------------------------------------ */
-export function CashFlowCard({ expenses, credits, categories, cardDue, catById, selMonth, sym }) {
+export function CashFlowCard({ expenses, credits, categories, cardDue, balances, catById, selMonth, sym }) {
   const months = [];
   for (let i = 5; i >= 0; i--) {
     const k = shiftMonth(selMonth, -i);
     const mi = monthIncome(credits, k);
-    const out = expenses.filter((e) => e.date.slice(0, 7) === k && catById[e.cat]?.section !== NONSPEND_SECTION).reduce((s, e) => s + e.amount, 0);
+    const out = expenses.filter((e) => periodOf(e.date) === k && catById[e.cat]?.section !== NONSPEND_SECTION).reduce((s, e) => s + e.amount, 0);
     months.push({ k, inc: mi.total, has: mi.has, out });
   }
   const max = Math.max(...months.map((m) => Math.max(m.inc, m.out)), 1);
 
   // Money calendar for the selected month: income on top, bills by due date below.
-  const N = daysIn(selMonth);
-  const today = new Date();
-  const isCur = selMonth === monthKey(today);
-  const ins = credits.filter((c) => c.date.slice(0, 7) === selMonth && isIncome(c.kind));
-  const bills = billsForMonth({ categories, expenses, credits, cardDue, selMonth }).filter((b) => b.date);
-  const pos = (d) => `${((Number(d.slice(8, 10)) - 0.5) / N) * 100}%`;
+  const N = periodDays(selMonth);
+  const isCur = selMonth === currentPeriod();
+  const dates = periodDates(selMonth);
+  const ins = credits.filter((c) => periodOf(c.date) === selMonth && isIncome(c.kind));
+  const bills = billsForMonth({ categories, expenses, credits, cardDue, balances, selMonth }).filter((b) => b.date);
+  const pos = (d) => `${((dayIndex(d, selMonth) - 0.5) / N) * 100}%`;
   const stillDue = bills.filter((b) => b.status !== "paid");
   const stillAmt = stillDue.reduce((s, b) => s + Math.max(0, b.due - b.paid), 0);
   const next = stillDue.filter((b) => b.status !== "overdue").sort((a, b) => a.date.localeCompare(b.date))[0];
@@ -397,14 +399,14 @@ export function CashFlowCard({ expenses, credits, categories, cardDue, catById, 
       </div>
 
       <div className="card-head" style={{ marginTop: 18, marginBottom: 0 }}>
-        <h2 style={{ fontSize: 14 }}>Money calendar · {monthLabel(selMonth, { month: "long" })}</h2>
+        <h2 style={{ fontSize: 14 }}>Money calendar · {shortDate(dates[0])} – {shortDate(dates[N - 1])}</h2>
       </div>
       <div className="tl" role="img" aria-label={`Income on ${ins.map((c) => c.date.slice(8, 10)).join(", ") || "no days yet"}; bills due on ${bills.map((b) => `${b.date.slice(8, 10)} ${b.name}`).join(", ")}`}>
         <span className="tl-axis" />
-        {isCur && <span className="tl-today" style={{ left: `${((today.getDate() - 0.5) / N) * 100}%` }} title="Today" />}
+        {isCur && <span className="tl-today" style={{ left: pos(todayIso()) }} title="Today" />}
         {ins.map((c) => <span key={c.id} className="tl-mark in" style={{ left: pos(c.date) }} title={`${c.date.slice(8, 10)}: +${money(c.amount, sym)} ${CREDIT_KINDS[c.kind].label}`} />)}
         {bills.map((b) => <span key={b.id} className={`tl-mark out ${b.status}`} style={{ left: pos(b.date) }} title={`${b.date.slice(8, 10)}: ${b.name} ${money(b.due, sym)} · ${b.status}`} />)}
-        {[1, 8, 15, 22, N].map((d) => <span key={d} className="tl-lbl" style={{ left: `${((d - 0.5) / N) * 100}%` }}>{d}</span>)}
+        {[1, 8, 15, 22, N].map((d) => <span key={d} className="tl-lbl" style={{ left: `${((d - 0.5) / N) * 100}%` }}>{Number(dates[d - 1].slice(8, 10))}</span>)}
       </div>
       <div className="tl-legend">
         <span><i style={{ background: "var(--teal)" }} />Income in</span>
@@ -425,7 +427,7 @@ export function CashFlowCard({ expenses, credits, categories, cardDue, catById, 
 /* ------------------------------------------------------------------ */
 /*  Top payees                                                         */
 /* ------------------------------------------------------------------ */
-export function PayeesCard({ fig, catById, sym }) {
+export function PayeesCard({ fig, catById, sym, onPick }) {
   const by = new Map();
   fig.month.forEach((e) => {
     // scheduled bills (EMI, maintenance, premiums) aren't "payees" worth watching
@@ -439,7 +441,7 @@ export function PayeesCard({ fig, catById, sym }) {
     r.cats[cn] = (r.cats[cn] || 0) + 1;
     by.set(k, r);
   });
-  const top = [...by.values()].sort((a, b) => b.amt - a.amt).slice(0, 6);
+  const top = [...by.values()].sort((a, b) => b.amt - a.amt).slice(0, 10);
   return (
     <section className="panel card-payees">
       <div className="card-head"><h2>Top payees</h2><span className="card-meta">day-to-day spend</span></div>
@@ -450,9 +452,11 @@ export function PayeesCard({ fig, catById, sym }) {
             const cat = Object.entries(p.cats).sort((a, b) => b[1] - a[1])[0][0];
             return (
               <li key={p.k}>
+                <button type="button" className="payee-btn" onClick={() => onPick && onPick({ type: "merchant", value: p.k, label: name })} title={`All payments to ${name}`}>
                 <span className="payee-ini" aria-hidden="true">{name.split(" ").map((w) => w[0]).join("").slice(0, 2)}</span>
                 <span className="payee-main"><span className="payee-name">{name}</span><span className="payee-sub">{cat} · {p.n} {p.n === 1 ? "entry" : "entries"}</span></span>
                 <span className="num payee-amt">{money(p.amt, sym)}</span>
+                </button>
               </li>
             );
           })}
@@ -508,6 +512,7 @@ export function QuickAdd({ categories, expenses, catPersonMap, defaultBank, sym,
   const [bank, setBank] = useState(defaultBank || "");
   const [date, setDate] = useState(todayISO());
   const [note, setNote] = useState("");
+  const [tags, setTags] = useState("");
   const [flash, setFlash] = useState("");
   const amtRef = useRef(null);
 
@@ -540,7 +545,7 @@ export function QuickAdd({ categories, expenses, catPersonMap, defaultBank, sym,
   const can = value > 0 && cat && date;
   const save = (again) => {
     if (!can) return;
-    onSave({ cat, amount: value, date, note: note.trim(), person: people, bank });
+    onSave({ cat, amount: value, date, note: note.trim(), person: people, bank, tags });
     const nm = categories.find((c) => c.id === cat)?.name;
     if (again) { setAmt(""); setNote(""); setFlash(`Saved ${money(value, sym)} to ${nm}`); setTimeout(() => setFlash(""), 2000); }
     else onClose();
@@ -601,6 +606,10 @@ export function QuickAdd({ categories, expenses, catPersonMap, defaultBank, sym,
         </div>
         <label className="qa-field qa-note"><span className="qa-label">Note (optional)</span>
           <input type="text" value={note} placeholder="e.g. DMart, vegetables" onChange={(e) => setNote(e.target.value)} onKeyDown={(e) => e.key === "Enter" && save(true)} />
+        </label>
+
+        <label className="qa-field qa-note"><span className="qa-label">Tags (optional — trip or event, e.g. bangkok2026)</span>
+          <input type="text" value={tags} placeholder="#diwali #bangkok2026" onChange={(e) => setTags(e.target.value)} />
         </label>
 
         <div className="qa-keypad" aria-label="Keypad">
@@ -848,7 +857,9 @@ export const dashCss = `
 .flow-col.sel .flow-m{color:var(--ink); font-weight:600;}
 
 .payee-list{list-style:none; margin:0; padding:0;}
-.payee-list li{display:flex; align-items:center; gap:12px; padding:8px 0; border-bottom:1px solid var(--hairline);}
+.payee-list li{border-bottom:1px solid var(--hairline);}
+.payee-btn{width:100%; display:flex; align-items:center; gap:12px; padding:8px 2px; border:0; background:none; font:inherit; color:inherit; text-align:left; cursor:pointer;}
+.payee-btn:hover{background:#F7F9F9;}
 .payee-ini{width:34px; height:34px; flex:none; border-radius:10px; background:var(--teal-soft); color:var(--teal); display:flex; align-items:center; justify-content:center; font:700 13px 'Space Grotesk',sans-serif;}
 .payee-main{flex:1; min-width:0; display:flex; flex-direction:column;}
 .payee-name{font-size:13.5px; font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
@@ -930,7 +941,7 @@ export const dashCss = `
 }
 @media (max-width:480px){
   .ledger-root{padding:12px 12px 100px;}
-  .entries li{grid-template-columns:48px minmax(0,1fr) auto 28px 28px!important;}
+  .entries li{grid-template-columns:48px minmax(0,1fr) auto 54px 28px!important;}
   .entries li .en-bank{display:none;}
   .en-cat{overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
   .mast-actions .btn-ghost,.mast-actions .btn-dark{padding:8px 11px;}
