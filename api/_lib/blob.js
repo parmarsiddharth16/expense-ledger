@@ -1,8 +1,14 @@
-import { put, list } from "@vercel/blob";
+import { put, list, del } from "@vercel/blob";
 
-/* Shared access to the single ledger.json blob that holds the whole ledger. */
+/* Shared access to the single ledger.json blob that holds the whole ledger,
+ * plus the snapshot files under history/ that make up its version history. */
 
 export const KEY = "ledger.json";
+export const HISTORY_KEY = "ledger:history"; // server-owned; never trusted from a client
+
+/* The blob's URL is stable (no random suffix), so once we know it a warm
+ * function can fetch it directly instead of paying for a list() call. */
+let ledgerUrl = null;
 
 export function resolveToken() {
   if (process.env.BLOB_READ_WRITE_TOKEN) return process.env.BLOB_READ_WRITE_TOKEN;
@@ -12,30 +18,64 @@ export function resolveToken() {
   return name ? process.env[name] : null;
 }
 
+export async function fetchJson(url, token) {
+  const res = await fetch(url, {
+    cache: "no-store",
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+  });
+  if (!res.ok) throw new Error(`blob fetch ${res.status}`);
+  return await res.json();
+}
+
+/* What this warm instance last wrote. The blob CDN can serve a just-overwritten
+ * file stale for up to a minute, so within that window our own copy wins. */
+let lastWritten = null;
+
 export async function readLedger(token) {
+  if (lastWritten && Date.now() - lastWritten.at < 90_000) return lastWritten.data;
   try {
+    if (ledgerUrl) {
+      try { return await fetchJson(ledgerUrl, token); } catch { ledgerUrl = null; }
+    }
     const { blobs } = await list({ prefix: KEY, token });
-    const blob = blobs.find((b) => b.pathname === KEY) || blobs[0];
+    const blob = blobs.find((b) => b.pathname === KEY);
     if (!blob) return {};
-    const res = await fetch(blob.url, {
-      cache: "no-store",
-      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-    });
-    if (!res.ok) return {};
-    return await res.json();
+    ledgerUrl = blob.url;
+    return await fetchJson(blob.url, token);
   } catch {
     return {};
   }
 }
 
 export async function writeLedger(data, token) {
-  await put(KEY, JSON.stringify(data), {
+  const r = await put(KEY, JSON.stringify(data), {
+    access: "private",
+    contentType: "application/json",
+    allowOverwrite: true,
+    addRandomSuffix: false,
+    cacheControlMaxAge: 60,
+    token,
+  });
+  if (r && r.url) ledgerUrl = r.url;
+  lastWritten = { at: Date.now(), data };
+  return r;
+}
+
+/** Store a full copy of the ledger as one version. Returns { pathname, url }. */
+export async function writeSnapshot(id, data, token) {
+  const r = await put(`history/${id}.json`, JSON.stringify(data), {
     access: "private",
     contentType: "application/json",
     allowOverwrite: true,
     addRandomSuffix: false,
     token,
   });
+  return { pathname: r.pathname, url: r.url };
+}
+
+export async function deleteBlobs(urls, token) {
+  if (!urls.length) return;
+  try { await del(urls, { token }); } catch { /* pruning is best-effort */ }
 }
 
 /** Read the body of a request whether the platform parsed it or not. */

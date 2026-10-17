@@ -2,13 +2,20 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
 import {
   ChevronLeft, ChevronRight, Plus, Trash2, SlidersHorizontal, X,
   TriangleAlert, Check, Wallet, ArrowUpRight, Sparkles, Eye, EyeOff,
-  Upload, FileSpreadsheet, ArrowRight, Search, Info, BarChart2, Pencil, Download
+  Upload, FileSpreadsheet, ArrowRight, Search, Info, BarChart2, Pencil, Download, LogOut
 } from "lucide-react";
 import {
   ComposedChart, BarChart, Bar, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, Legend
 } from "recharts";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
+import { merchantKey } from "./api/_lib/categorize.js";
+import {
+  useMonthFigures, KpiStrip, PaceCard, BillsCard, BudgetsCard, StructureCard,
+  CashFlowCard, PayeesCard, SetAsideCard, QuickAdd, HistoryView, dashCss,
+} from "./src/dashboard.jsx";
+
+export const APP_VERSION = "2.0.0";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -30,7 +37,7 @@ const monthLabel = (k, o = { month: "long", year: "numeric" }) => {
   const [y, m] = k.split("-").map(Number);
   return new Date(y, m - 1, 1).toLocaleDateString("en-US", o);
 };
-const todayISO = () => new Date().toISOString().slice(0, 10);
+const todayISO = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
 
 const FY_START = "2026-04", FY_END = "2027-03";
 
@@ -133,26 +140,39 @@ const buildIncome = () => [
 
 /* -------------------------------------------------------------------------
  * Cloud-backed store.
- * Data now lives in a single JSON blob on the server (/api/data, Vercel Blob)
- * so it persists across devices, browsers, and deployments. localStorage is
- * kept as an offline cache / fallback: if the network or the blob store is
- * unavailable, the app still works exactly as it did before (device-local).
- * Bank-statement passwords (ledger:*Pwd) are deliberately NOT synced — they
- * stay on the device only.
+ * Data lives in a single JSON blob on the server (/api/data, Vercel Blob) so it
+ * persists across devices, browsers, and deployments. It is held in memory
+ * only while the app is unlocked — nothing from the ledger is cached in this
+ * browser any more, so a device that hasn't entered the passcode this visit
+ * has nothing to show. Bank-statement passwords (ledger:*Pwd) are the one
+ * exception: they stay in this browser only and are never synced.
  * ---------------------------------------------------------------------- */
 const SENSITIVE = /Pwd$/; // password keys never leave the device
 
-/* The ledger passcode. Held in this tab only, mirrored to localStorage so a
- * reload doesn't ask again, and sent as a header on every API call. It is not
- * part of the synced payload — SENSITIVE keeps *Pwd keys local, and this never
- * enters the cache at all. */
+/* Older versions cached the whole ledger (and the passcode) in localStorage.
+ * Clear that out on first load so it doesn't linger on shared devices. */
+const KEEP_LOCAL = /Pwd$|^ledger:(lastBank|catPersonMap)$/;
+function purgeLocalCache() {
+  try {
+    const drop = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("ledger:") && (!KEEP_LOCAL.test(k) || k === "ledger:passPwd")) drop.push(k);
+    }
+    drop.forEach((k) => localStorage.removeItem(k));
+    sessionStorage.removeItem("ledger:gate");
+  } catch {}
+}
+purgeLocalCache();
+
+/* The ledger passcode. Held in memory only — never written to localStorage,
+ * sessionStorage or a cookie — so every new visit, tab or reload asks for it
+ * again, and logging out (or closing the tab) leaves nothing behind that opens
+ * the ledger. Sent as a header on every API call. */
 export const auth = {
-  pass: (() => { try { return localStorage.getItem("ledger:passPwd") || ""; } catch { return ""; } })(),
+  pass: "",
   needed: false,
-  set(p) {
-    this.pass = p || "";
-    try { p ? localStorage.setItem("ledger:passPwd", p) : localStorage.removeItem("ledger:passPwd"); } catch {}
-  },
+  set(p) { this.pass = p || ""; },
   headers(extra) {
     const h = { ...(extra || {}) };
     if (this.pass) h["x-ledger-pass"] = this.pass;
@@ -179,24 +199,18 @@ export async function api(path, opts = {}) {
   return json;
 }
 
-const store = {
+export const store = {
   cache: null,
   ready: false,
   _timer: null,
+  _pending: null,
   protectedRemote: null, // null = unknown, false = API is open to anyone
+  syncState: "idle",     // idle | saving | error
+  loaded: false,         // true only when the server's copy was actually read
   async init() {
     if (this.ready) return;
     this.cache = {};
-    // seed from localStorage first (works offline / instant)
-    try {
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        if (!key || !key.startsWith("ledger:") || SENSITIVE.test(key)) continue;
-        try { this.cache[key] = JSON.parse(localStorage.getItem(key)); }
-        catch { this.cache[key] = localStorage.getItem(key); }
-      }
-    } catch {}
-    // overlay the cloud copy (source of truth across devices)
+    this.loaded = false;
     try {
       const res = await fetch("/api/data", { cache: "no-store", headers: auth.headers() });
       if (res.status === 401) {
@@ -209,42 +223,65 @@ const store = {
         const json = await res.json();
         this.protectedRemote = !!(json && json.protected);
         const remote = json && json.data;
-        if (remote && typeof remote === "object" && Object.keys(remote).length) {
-          this.cache = { ...this.cache, ...remote };
-          try { for (const k in remote) localStorage.setItem(k, JSON.stringify(remote[k])); } catch {}
-        }
+        if (remote && typeof remote === "object") { this.cache = { ...remote }; this.loaded = true; }
       }
     } catch {}
     this.ready = true;
   },
   async get(k) {
-    if (this.cache && k in this.cache) return this.cache[k];
-    try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : null; } catch { return null; }
+    if (SENSITIVE.test(k)) { try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : null; } catch { return null; } }
+    return this.cache && k in this.cache ? this.cache[k] : null;
   },
   async set(k, v) {
+    if (SENSITIVE.test(k)) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} return; }
     if (!this.cache) this.cache = {};
     this.cache[k] = v;
-    try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { console.error(e); }
-    if (!SENSITIVE.test(k)) this._scheduleSync();
+    this._scheduleSync();
   },
   _scheduleSync() {
     if (this._timer) clearTimeout(this._timer);
-    this._timer = setTimeout(() => this._sync(), 800);
+    this._timer = setTimeout(() => { this._timer = null; this._sync(); }, 800);
   },
+  _setState(s) { this.syncState = s; window.dispatchEvent(new CustomEvent("ledger:sync", { detail: s })); },
   async _sync() {
     const payload = {};
     for (const k in this.cache) if (!SENSITIVE.test(k)) payload[k] = this.cache[k];
     // never push an empty ledger over a populated one
     if (!Object.keys(payload).length) return;
-    try {
-      await fetch("/api/data", {
-        method: "POST",
-        headers: auth.headers({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ data: payload }),
-      });
-    } catch { /* stays in localStorage; retries on next change */ }
+    this._setState("saving");
+    const run = (async () => {
+      try {
+        const res = await fetch("/api/data", {
+          method: "POST",
+          headers: auth.headers({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ data: payload }),
+        });
+        if (res.status === 401) { window.dispatchEvent(new CustomEvent("ledger:needs-passcode")); this._setState("error"); return; }
+        this._setState(res.ok ? "idle" : "error");
+      } catch { this._setState("error"); }
+    })();
+    this._pending = run;
+    await run;
+  },
+  /** Push any change still waiting for its debounce, then wait for it. */
+  async flush() {
+    if (this._timer) { clearTimeout(this._timer); this._timer = null; await this._sync(); }
+    else if (this._pending) await this._pending;
+  },
+  /** Forget everything held in memory (used on logout and after a restore). */
+  reset() {
+    if (this._timer) clearTimeout(this._timer);
+    this._timer = null; this._pending = null; this.cache = null; this.ready = false;
   },
 };
+
+/** Log out: save anything pending, then drop the passcode and the in-memory ledger. */
+export async function logout() {
+  try { await store.flush(); } catch {}
+  store.reset();
+  auth.set("");
+  window.dispatchEvent(new CustomEvent("ledger:logout"));
+}
 const K_CATS = "ledger:categories", K_EXP = "ledger:expenses", K_SET = "ledger:settings", K_INC = "ledger:income";
 const K_MAP = "ledger:merchantMap", K_STMTS = "ledger:stmts", K_AUDIT = "ledger:audit";
 
@@ -299,6 +336,7 @@ const widthForRatio = (p) => {
 /* ------------------------------------------------------------------ */
 export default function ExpenseLedger() {
   const [loading, setLoading] = useState(true);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [categories, setCategories] = useState([]);
   const [income, setIncome] = useState([]);
   const [expenses, setExpenses] = useState([]);
@@ -306,33 +344,33 @@ export default function ExpenseLedger() {
   const [selMonth, setSelMonth] = useState(monthKey(new Date()));
   const [manageOpen, setManageOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [quickOpen, setQuickOpen] = useState(false);
+  const [stmtOpen, setStmtOpen] = useState(false);
   const [merchantMap, setMerchantMap] = useState({});
-  const [hideEmpty, setHideEmpty] = useState(true);
   const [stmts, setStmts] = useState({});
   const [auditLog, setAuditLog] = useState([]);
-  const [needsPass, setNeedsPass] = useState(false);
-  const [passInput, setPassInput] = useState("");
   const [apiOpen, setApiOpen] = useState(false); // API reachable without a passcode
+  const [sync, setSync] = useState("idle");
 
-  const [fCat, setFCat] = useState("");
-  const [fAmt, setFAmt] = useState("");
-  const [fDate, setFDate] = useState(todayISO());
-  const [fNote, setFNote] = useState("");
-  const [fPerson, setFPerson] = useState([]);
-  const [fBank, setFBank] = useState(() => { try { return localStorage.getItem("ledger:lastBank") || ""; } catch { return ""; } });
+  const [lastBank, setLastBank] = useState(() => { try { return localStorage.getItem("ledger:lastBank") || ""; } catch { return ""; } });
   const [catPersonMap, setCatPersonMap] = useState(() => { try { return JSON.parse(localStorage.getItem("ledger:catPersonMap") || "{}"); } catch { return {}; } });
-  const [addedFlash, setAddedFlash] = useState(false);
   const [reportFlash, setReportFlash] = useState(false);
   const [backupFlash, setBackupFlash] = useState(false);
   const [view, setView] = useState("dashboard");
   const [editingId, setEditingId] = useState(null);
   const [editForm, setEditForm] = useState({});
   const [entrySearch, setEntrySearch] = useState("");
+  const entriesRef = React.useRef(null);
 
   /* ---- load once (with name-based expense remap on reseed) ---- */
   useEffect(() => {
     (async () => {
       await store.init();
+      if (!store.loaded) {
+        // Never seed or save anything unless the real ledger was read first —
+        // otherwise a network blip could push a blank ledger over the real one.
+        setLoadFailed(true); setLoading(false); return;
+      }
       const ver = await store.get("ledger:catVersion");
       let cats = await store.get(K_CATS);
       let inc = await store.get(K_INC);
@@ -364,8 +402,6 @@ export default function ExpenseLedger() {
         await store.set("ledger:catVersion", CAT_VERSION);
       }
       if (!inc) { inc = buildIncome(); await store.set(K_INC, inc); }
-      // Additive: bring in categories introduced after this ledger was seeded,
-      // without a reseed (which would reset hand-edited budgets).
       const missingNS = NONSPEND_SEED.filter((nm) => !cats.some((c) => c.name === nm));
       if (missingNS.length) {
         cats = [...cats, ...missingNS.map((name) => ({ id: uid(), name, section: NONSPEND_SECTION, recurring: true, monthly: flat(0) }))];
@@ -379,30 +415,17 @@ export default function ExpenseLedger() {
       setStmts(stmtsData);
       setAuditLog(auditData);
       setSym(settings.sym || "₹");
-      setNeedsPass(!!auth.needed);
       setApiOpen(store.protectedRemote === false);
       setLoading(false);
     })();
 
-    const onNeeds = () => setNeedsPass(true);
-    window.addEventListener("ledger:needs-passcode", onNeeds);
-    return () => window.removeEventListener("ledger:needs-passcode", onNeeds);
+    const onSync = (e) => setSync(e.detail);
+    // closing the tab with a save still in flight would lose it — ask first
+    const onLeave = (e) => { if (store._timer || store.syncState === "saving") { e.preventDefault(); e.returnValue = ""; } };
+    window.addEventListener("ledger:sync", onSync);
+    window.addEventListener("beforeunload", onLeave);
+    return () => { window.removeEventListener("ledger:sync", onSync); window.removeEventListener("beforeunload", onLeave); };
   }, []);
-
-  const submitPasscode = async (e) => {
-    e.preventDefault();
-    auth.set(passInput.trim());
-    try {
-      const j = await api("/api/data");
-      store.cache = { ...(store.cache || {}), ...(j.data || {}) };
-      setNeedsPass(false);
-      setPassInput("");
-      window.location.reload();
-    } catch {
-      auth.set("");
-      setPassInput("");
-    }
-  };
 
   const saveCats = useCallback((n) => { setCategories(n); store.set(K_CATS, n); }, []);
   const saveExps = useCallback((n) => { setExpenses(n); store.set(K_EXP, n); }, []);
@@ -410,14 +433,11 @@ export default function ExpenseLedger() {
   const saveStmts = useCallback((n) => { setStmts(n); store.set(K_STMTS, n); }, []);
   const saveAudit = useCallback((n) => { setAuditLog(n); store.set(K_AUDIT, n); }, []);
 
-  useEffect(() => { if (!fCat && categories.length) setFCat(categories[0].id); }, [categories, fCat]);
-
   /* ---- derived ---- */
   const catById = useMemo(() => { const m = {}; categories.forEach((c) => (m[c.id] = c)); return m; }, [categories]);
-  const isNonSpend = useCallback((catId) => catById[catId]?.section === NONSPEND_SECTION, [catById]);
   const monthExpenses = useMemo(() => expenses.filter((e) => e.date.slice(0, 7) === selMonth), [expenses, selMonth]);
-  const spendMonthExpenses = useMemo(() => monthExpenses.filter((e) => !isNonSpend(e.cat)), [monthExpenses, isNonSpend]);
   const spentByCat = useMemo(() => { const m = {}; monthExpenses.forEach((e) => (m[e.cat] = (m[e.cat] || 0) + e.amount)); return m; }, [monthExpenses]);
+  const fig = useMonthFigures({ expenses, categories, catById, selMonth });
 
   const rows = useMemo(() => categories.map((c) => {
     const spent = spentByCat[c.id] || 0;
@@ -436,12 +456,13 @@ export default function ExpenseLedger() {
     [monthExpenses, catById]
   );
 
+  /* grouped rows — used by Analysis and the shareable report */
   const grouped = useMemo(() => {
     const out = [];
     SECTIONS.forEach((sec) => {
       const all = rows.filter((r) => r.section === sec);
       if (!all.length) return;
-      const vis = hideEmpty ? all.filter((r) => !(r.budget === 0 && r.spent === 0)) : all;
+      const vis = all.filter((r) => !(r.budget === 0 && r.spent === 0));
       if (!vis.length) return;
       out.push({
         section: sec,
@@ -459,53 +480,36 @@ export default function ExpenseLedger() {
       });
     }
     return out;
-  }, [rows, hideEmpty, orphanSpent]);
+  }, [rows, orphanSpent]);
 
-  const spendCats = useMemo(() => categories.filter((c) => c.section !== NONSPEND_SECTION), [categories]);
-  const totalBudget = useMemo(() => spendCats.reduce((s, c) => s + budgetFor(c, selMonth), 0), [spendCats, selMonth]);
-  const totalSpent = useMemo(() => spendMonthExpenses.reduce((s, e) => s + e.amount, 0), [spendMonthExpenses]);
+  const totalBudget = fig.budget;
+  const totalSpent = fig.spent;
   const totalIncome = useMemo(() => income.reduce((s, l) => s + (l.monthly[mIdx(selMonth)] || 0), 0), [income, selMonth]);
-  const remaining = totalBudget - totalSpent;
-  const usedPct = totalBudget > 0 ? (totalSpent / totalBudget) * 100 : 0;
   const net = totalIncome - totalSpent;
   const savingsRate = totalIncome > 0 ? (net / totalIncome) * 100 : 0;
-
   const overRows = rows.filter((r) => r.status === "over" || r.status === "unbudgeted");
-  const hiddenCount = hideEmpty
-    ? rows.filter((r) => r.budget === 0 && r.spent === 0).length
-    : 0;
-  const totalOver = overRows.reduce((s, r) => s + (r.budget > 0 ? r.spent - r.budget : r.spent), 0)
-    + (orphanSpent > 0 ? orphanSpent : 0);
-
-  const trend = useMemo(() => {
-    const keys = [];
-    for (let i = 5; i >= 0; i--) keys.push(shiftMonth(selMonth, -i));
-    return keys.map((k) => ({
-      label: monthLabel(k, { month: "short" }),
-      spent: expenses.filter((e) => e.date.slice(0, 7) === k && !isNonSpend(e.cat)).reduce((s, e) => s + e.amount, 0),
-      budget: spendCats.reduce((s, c) => s + budgetFor(c, k), 0),
-    }));
-  }, [expenses, spendCats, selMonth, isNonSpend]);
 
   /* ---- actions ---- */
-  const addExpense = () => {
-    const amt = parseFloat(fAmt);
-    if (!fCat || !amt || amt <= 0 || !fDate) return;
-    const personStr = fPerson.join(",");
-    const entry = { id: uid(), cat: fCat, amount: amt, date: fDate, note: fNote.trim() };
-    if (personStr) entry.person = personStr;
-    if (fBank) { entry.bank = fBank; try { localStorage.setItem("ledger:lastBank", fBank); } catch {} }
-    saveExps([entry, ...expenses]);
-    if (fPerson.length > 0) {
-      const next = { ...catPersonMap, [fCat]: fPerson };
-      setCatPersonMap(next);
-      try { localStorage.setItem("ledger:catPersonMap", JSON.stringify(next)); } catch {}
+  const addExpense = ({ cat, amount, date, note, person = [], bank }) => {
+    if (!cat || !amount || amount <= 0 || !date) return;
+    const entry = { id: uid(), cat, amount, date, note: note || "", src: "manual" };
+    if (person.length) entry.person = person.join(",");
+    if (bank) { entry.bank = bank; setLastBank(bank); try { localStorage.setItem("ledger:lastBank", bank); } catch {} }
+    setExpenses((prev) => { const n = [entry, ...prev]; store.set(K_EXP, n); return n; });
+    if (person.length) {
+      setCatPersonMap((prev) => {
+        const next = { ...prev, [cat]: person };
+        try { localStorage.setItem("ledger:catPersonMap", JSON.stringify(next)); } catch {}
+        return next;
+      });
     }
-    setFAmt(""); setFNote(""); setFPerson([]);
-    setAddedFlash(true); setTimeout(() => setAddedFlash(false), 1600);
-    if (fDate.slice(0, 7) !== selMonth) setSelMonth(fDate.slice(0, 7));
+    if (date.slice(0, 7) !== selMonth) setSelMonth(date.slice(0, 7));
   };
-  const delExpense = (id) => saveExps(expenses.filter((e) => e.id !== id));
+  const delExpense = (id) => {
+    const e = expenses.find((x) => x.id === id);
+    if (e && !window.confirm(`Delete ${money(e.amount, sym)} · ${catById[e.cat]?.name || "Uncategorised"} on ${e.date}?`)) return;
+    saveExps(expenses.filter((x) => x.id !== id));
+  };
 
   const startEdit = (e) => {
     setEditingId(e.id);
@@ -525,7 +529,7 @@ export default function ExpenseLedger() {
   const backupData = () => {
     try {
       const data = {
-        _meta: { app: "Manali's Ledger", exportedAt: new Date().toISOString(), version: CAT_VERSION },
+        _meta: { app: "Manali's Ledger", exportedAt: new Date().toISOString(), version: CAT_VERSION, appVersion: APP_VERSION },
         "ledger:categories": categories,
         "ledger:income": income,
         "ledger:expenses": expenses,
@@ -539,7 +543,7 @@ export default function ExpenseLedger() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "manali-ledger-backup-" + new Date().toISOString().slice(0, 10) + ".json";
+      a.download = "manali-ledger-backup-" + todayISO() + ".json";
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 4000);
       setBackupFlash(true); setTimeout(() => setBackupFlash(false), 1600);
@@ -601,14 +605,15 @@ export default function ExpenseLedger() {
   };
 
   /* Clearing a Suspense row is the moment merchant memory learns something —
-   * the same payee should never land in Suspense twice for the same reason. */
+   * the same payee should never land in Suspense twice for the same reason.
+   * Learned under the payee-aware key the categoriser looks up. */
   const clearSuspense = (id, catId) => {
     const row = expenses.find((e) => e.id === id);
     if (!row || !catId) return;
     saveExps(expenses.map((e) => (e.id === id
       ? { ...e, cat: catId, prov: { layer: "manual", confidence: 1, reason: "cleared from Suspense" } }
       : e)));
-    const mk = normMerchant(row.note);
+    const mk = merchantKey(row.note);
     if (mk) { const m = { ...merchantMap, [mk]: catId }; setMerchantMap(m); store.set(K_MAP, m); }
     saveAudit([{
       id: uid(), at: new Date().toISOString(), kind: "suspense-cleared",
@@ -631,61 +636,45 @@ export default function ExpenseLedger() {
   const delCategory = (id) => {
     const c = catById[id];
     const n = expenses.filter((e) => e.cat === id).length;
-    if (!window.confirm(n ? `Delete "${c.name}" and its ${n} logged expense${n > 1 ? "s" : ""}? Can't be undone.` : `Delete "${c.name}"?`)) return;
+    if (!window.confirm(n ? `Delete "${c.name}" and its ${n} logged expense${n > 1 ? "s" : ""}? (It can be brought back from History.)` : `Delete "${c.name}"?`)) return;
     saveCats(categories.filter((c) => c.id !== id));
     if (n) saveExps(expenses.filter((e) => e.cat !== id));
   };
 
-  const loadSample = () => {
-    const find = (nm) => categories.find((c) => c.name === nm)?.id;
-    const base = selMonth + "-";
-    const day = (d) => base + String(d).padStart(2, "0");
-    const raw = [
-      ["Grocery", 4200, 4, "DMart stock-up"],
-      ["Grocery", 3800, 17, "Vegetables + dairy"],
-      ["Grocery", 11500, 27, "Festive groceries"],
-      ["Food & Travel", 9200, 9, "Work travel + meals"],
-      ["Food & Travel", 6400, 14, "Weekend outing"],
-      ["Medical", 5600, 11, "Consultation + pharmacy"],
-      ["Holiday", 38000, 20, "Goa trip advance"],
-      ["Shopping", 7200, 22, "Clothes"],
-      ["Shopping", 3500, 6, "Home items"],
-      ["Entertainment", 2400, 13, "Movie + dinner"],
-      ["Bike", 1800, 8, "Servicing"],
-      ["Parlour", 900, 16, "Salon"],
-    ];
-    const sample = raw
-      .filter((r) => find(r[0]))
-      .map((r) => ({ id: uid(), cat: find(r[0]), amount: r[1], date: day(r[2]), note: r[3] }));
-    saveExps([...sample, ...expenses]);
+  /* Clicking a budget row shows that category's entries below. */
+  const pickBudgetRow = (r) => {
+    setEntrySearch(r.id === "__uncat__" ? "Uncategorised" : r.name);
+    setTimeout(() => entriesRef.current && entriesRef.current.scrollIntoView({ behavior: "smooth", block: "start" }), 30);
   };
 
   if (loading) return (<div className="ledger-root"><Styles /><div className="loading">Opening your ledger…</div></div>);
 
-  if (needsPass) return (
+  if (loadFailed) return (
     <div className="ledger-root"><Styles />
       <div className="passgate">
-        <form className="passcard" onSubmit={submitPasscode}>
-          <h2>Manali's Ledger</h2>
-          <p>Enter the ledger passcode to continue.</p>
-          <input type="password" autoFocus value={passInput} placeholder="Passcode"
-                 onChange={(e) => setPassInput(e.target.value)} />
-          <button className="btn-add" type="submit" disabled={!passInput.trim()}>Unlock</button>
-        </form>
+        <div className="passcard">
+          <h2>Couldn't load the ledger</h2>
+          <p>The server didn't answer. Nothing has been changed. Check your connection and try again.</p>
+          <button className="btn-add" onClick={() => window.dispatchEvent(new CustomEvent("ledger:reload"))}>Try again</button>
+        </div>
       </div>
     </div>
   );
 
   const suspenseRows = expenses.filter((e) => e.cat === SUSPENSE_ID)
     .sort((a, b) => (b.date || "").localeCompare(a.date || "") || b.amount - a.amount);
-
+  const stmtDone = (stmts[selMonth] || []).filter((k) => STMT_BANKS.some((b) => b.key === k)).length;
   const selIdxLabel = monthLabel(selMonth);
+  const tabs = [
+    ["dashboard", "Dashboard"], ["analysis", "Analysis"],
+    ["suspense", "Suspense"], ["history", "History"], ["audit", "Audit"],
+  ];
 
   return (
     <div className="ledger-root">
       <Styles />
 
-      <header className="mast">
+      <header className="mast2">
         <div className="mast-title">
           <span className="mast-mark"><Wallet size={18} strokeWidth={2.2} /></span>
           <div>
@@ -693,100 +682,39 @@ export default function ExpenseLedger() {
             <p>FY 2026–27 · budget vs. spend, month by month</p>
           </div>
         </div>
-        <div className="mast-controls">
+
+        <nav className="navtabs" aria-label="Sections">
+          {tabs.map(([k, l]) => (
+            <button key={k} className={view === k ? "on" : ""} aria-current={view === k ? "page" : undefined} onClick={() => setView(k)}>
+              {l}{k === "suspense" && suspenseRows.length ? <span className="pill-count">{suspenseRows.length}</span> : null}
+            </button>
+          ))}
+          <button onClick={() => setManageOpen(true)}>Budgets</button>
+        </nav>
+
+        <div className="mast-actions">
           <div className="monthnav">
             <button aria-label="Previous month" onClick={() => setSelMonth(shiftMonth(selMonth, -1))}><ChevronLeft size={18} /></button>
             <span className="monthnav-label">{selIdxLabel}</span>
             <button aria-label="Next month" onClick={() => setSelMonth(shiftMonth(selMonth, 1))}><ChevronRight size={18} /></button>
           </div>
-          <button className="btn-ghost" onClick={() => setImportOpen(true)}><Upload size={15} /> Import</button>
-          <button className="btn-ghost" onClick={() => setManageOpen(true)}><SlidersHorizontal size={15} /> Budgets</button>
-          <button className={`btn-ghost${view === "analysis" ? " btn-ghost-active" : ""}`} onClick={() => setView(v => v === "analysis" ? "dashboard" : "analysis")}><BarChart2 size={15} /> Analysis</button>
-          <button className={`btn-ghost${view === "suspense" ? " btn-ghost-active" : ""}`} onClick={() => setView(v => v === "suspense" ? "dashboard" : "suspense")}>
-            <Info size={15} /> Suspense{suspenseRows.length ? <span className="pill-count">{suspenseRows.length}</span> : null}
+          <button className={`btn-ghost stmt-badge ${stmtDone === STMT_BANKS.length ? "done" : "todo"}`} aria-expanded={stmtOpen} onClick={() => setStmtOpen((v) => !v)} title="Statements imported this month">
+            {stmtDone === STMT_BANKS.length ? <Check size={15} /> : <TriangleAlert size={15} />} Statements <strong>{stmtDone}/{STMT_BANKS.length}</strong>
           </button>
-          <button className={`btn-ghost${view === "audit" ? " btn-ghost-active" : ""}`} onClick={() => setView(v => v === "audit" ? "dashboard" : "audit")}><Check size={15} /> Audit</button>
-          <button className={`btn-ghost${backupFlash ? " btn-ghost-active" : ""}`} onClick={backupData} title="Download a full backup of your ledger as a JSON file"><Download size={15} /> {backupFlash ? "Saved!" : "Backup"}</button>
-          <button className={`btn-ghost${reportFlash ? " btn-ghost-active" : ""}`} onClick={generateReport}><ArrowUpRight size={15} /> {reportFlash ? "Copied! 🎉" : "Share"}</button>
+          <button className="btn-dark" onClick={() => setImportOpen(true)}><Upload size={15} /> Import</button>
+          <button className="btn-ghost" onClick={backupData} title="Download a full backup of your ledger as a JSON file"><Download size={15} /> {backupFlash ? "Saved!" : "Backup"}</button>
+          <button className="btn-ghost" onClick={generateReport} title="Copy a WhatsApp-ready summary of this month"><ArrowUpRight size={15} /> {reportFlash ? "Copied!" : "Share"}</button>
+          <button className="btn-ghost btn-logout" onClick={() => logout()} title="Save and lock the ledger on this device"><LogOut size={15} /> Log out</button>
         </div>
       </header>
 
-      {/* log */}
-      <section className="panel logbar">
-        <div className="panel-head"><h2>Log an expense</h2></div>
-        <div className="logform">
-          <select value={fCat} onChange={(e) => {
-            const id = e.target.value; setFCat(id);
-            const saved = catPersonMap[id]; setFPerson(saved ? [...saved] : []);
-          }} aria-label="Category">
-            {SECTIONS.map((sec) => {
-              const opts = categories.filter((c) => c.section === sec);
-              if (!opts.length) return null;
-              return (<optgroup key={sec} label={sec}>{opts.map((c) => (<option key={c.id} value={c.id}>{c.name}</option>))}</optgroup>);
-            })}
-            {categories.some((c) => !SECTIONS.includes(c.section)) && (
-              <optgroup label="Other">{categories.filter((c) => !SECTIONS.includes(c.section)).map((c) => (<option key={c.id} value={c.id}>{c.name}</option>))}</optgroup>
-            )}
-          </select>
-          <div className="amt-input"><span>{sym.trim()}</span>
-            <input type="number" min="0" placeholder="Amount" value={fAmt} onChange={(e) => setFAmt(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addExpense()} />
-          </div>
-          <input type="date" value={fDate} onChange={(e) => setFDate(e.target.value)} aria-label="Date" />
-          <select className="bank-select" value={fBank} onChange={(e) => setFBank(e.target.value)} aria-label="Account / card used">
-            <option value="">&mdash; account &mdash;</option>
-            <BankOptions />
-          </select>
-          <input type="text" placeholder="Note (optional)" value={fNote} onChange={(e) => setFNote(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addExpense()} />
-          <button className={`btn-add${addedFlash ? " flash" : ""}`} onClick={addExpense}><Plus size={16} /> {addedFlash ? "Saved!" : "Add"}</button>
-          {catById[fCat] && (
-            <div className="person-row">
-              <span className="person-label">For:</span>
-              {["Sid", "Manali", "Saryu"].map((p) => (
-                <button key={p} type="button"
-                  className={`person-btn${fPerson.includes(p) ? " on" : ""}`}
-                  onClick={() => setFPerson((prev) => prev.includes(p) ? prev.filter((x) => x !== p) : [...prev, p])}>
-                  {p}
-                </button>
-              ))}
-              {fPerson.length > 1 && <span className="split-hint">split {fPerson.length} ways</span>}
-            </div>
-          )}
-        </div>
-      </section>
-
-      <StatementStatus stmts={stmts} selMonth={selMonth} onToggle={(key) => {
-        const cur = stmts[selMonth] || [];
-        const next = cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key];
-        saveStmts({ ...stmts, [selMonth]: next });
-      }} />
-
-      {/* summary strip */}
-      <section className="strip">
-        <Stat label="Budgeted" value={money(totalBudget, sym)} />
-        <Stat label="Spent" value={money(totalSpent, sym)} accent={usedPct > 100 ? "red" : "ink"} />
-        <Stat label="Remaining" value={moneySigned(remaining, sym)} accent={remaining < 0 ? "red" : "teal"} />
-        <Stat
-          label={net < 0 ? "Overspent" : "Net saved"}
-          value={moneySigned(net, sym)}
-          accent={net < 0 ? "red" : "teal"}
-          sub={totalIncome > 0 ? `${savingsRate.toFixed(0)}% savings rate` : null}
-        />
-      </section>
-
-      <div className="usebar-wrap">
-        <span className="usebar-label">
-          {usedPct.toFixed(0)}% of {monthLabel(selMonth, { month: "short" })} budget spent
-        </span>
-        <div className="usebar">
-          <div className="usebar-fill" style={{ width: `${Math.min(usedPct, 100)}%`, background: usedPct > 100 ? "var(--red)" : usedPct >= 80 ? "var(--amber)" : "var(--teal)" }} />
-        </div>
-        {usedPct > 100 && <span className="usebar-over num">+{(usedPct - 100).toFixed(0)}%</span>}
-      </div>
-
-      {overRows.length > 0 && (
-        <div className="alert">
-          <TriangleAlert size={17} strokeWidth={2.2} />
-          <span>You went over in <strong>{overRows.length}</strong> {overRows.length > 1 ? "categories" : "category"} this month — <strong>{money(totalOver, sym)}</strong> beyond plan.</span>
+      {stmtOpen && (
+        <div className="stmt-pop">
+          <StatementStatus stmts={stmts} selMonth={selMonth} onToggle={(key) => {
+            const cur = stmts[selMonth] || [];
+            const next = cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key];
+            saveStmts({ ...stmts, [selMonth]: next });
+          }} />
         </div>
       )}
 
@@ -796,6 +724,9 @@ export default function ExpenseLedger() {
           Set <code>LEDGER_PASSCODE</code> in the Vercel project settings to lock it.
         </div>
       )}
+      {sync === "error" && (
+        <div className="alert"><TriangleAlert size={17} /> <span>Your last change couldn't be saved to the server. Check your connection — it will retry on your next change.</span></div>
+      )}
 
       {view === "analysis" ? (
         <AnalysisView grouped={grouped} sym={sym} selMonth={selMonth} expenses={expenses} categories={categories} catById={catById} />
@@ -804,128 +735,30 @@ export default function ExpenseLedger() {
                       onDelete={(id) => saveExps(expenses.filter((e) => e.id !== id))} />
       ) : view === "audit" ? (
         <AuditView log={auditLog} sym={sym} />
+      ) : view === "history" ? (
+        <HistoryView sym={sym} />
       ) : (<>
-      <div className="grid">
-        {/* ledger */}
-        <section className="panel ledger-panel">
-          <div className="panel-head">
-            <h2>Where it went</h2>
-            <button className="toggle" onClick={() => setHideEmpty((v) => !v)}>
-              {hideEmpty ? <EyeOff size={14} /> : <Eye size={14} />}
-              {hideEmpty ? `Hiding ${hiddenCount} empty` : "Showing all"}
-            </button>
-          </div>
+      <KpiStrip fig={fig} income={totalIncome} sym={sym} selMonth={selMonth} />
 
-          {grouped.length === 0 && <div className="empty">Nothing budgeted or spent in {selIdxLabel}.</div>}
-
-          {grouped.map((g) => {
-            const secOver = g.spent > g.budget && g.budget > 0;
-            return (
-              <div className={`sec${g.nonSpend ? " sec-nonspend" : ""}`} key={g.section}>
-                <div className="sec-head">
-                  <span className="sec-name">{g.section}</span>
-                  <span className="sec-sub num">
-                    <span className={!g.nonSpend && (secOver || g.budget === 0) ? "fig-over" : ""}>{money(g.spent, sym)}</span>
-                    <span className="row-of">{g.nonSpend ? " · not counted in spend" : g.budget > 0 ? ` / ${money(g.budget, sym)}` : " · unbudgeted"}</span>
-                  </span>
-                </div>
-                <div className="rows">
-                  {g.rows.map((r) => {
-                    const w = r.status === "tracked" ? (r.spent > 0 ? BUDGET_POS : 0) : widthForRatio(r.ratio === Infinity ? 1.6 : r.ratio);
-                    const under = Math.min(w, BUDGET_POS);
-                    const over = Math.max(0, w - BUDGET_POS);
-                    const underColor = r.status === "tracked" ? "var(--muted)" : r.status === "caution" ? "var(--amber)" : r.status === "unbudgeted" ? "var(--red-soft)" : "var(--teal)";
-                    const diff = r.budget > 0 ? r.spent - r.budget : r.spent;
-                    return (
-                      <div className="row" key={r.id}>
-                        <div className="row-top">
-                          <span className="row-name">{r.name}</span>
-                          <span className="row-fig num">
-                            <span className={r.status === "over" || r.status === "unbudgeted" ? "fig-over" : ""}>{money(r.spent, sym)}</span>
-                            <span className="row-of">{r.status === "tracked" ? "" : r.budget > 0 ? ` / ${money(r.budget, sym)}` : " · no budget"}</span>
-                          </span>
-                        </div>
-                        <div className="track">
-                          {r.budget > 0 && <span className="track-marker" style={{ left: `${BUDGET_POS}%` }} />}
-                          <span className="seg under" style={{ width: `${under}%`, background: underColor }} />
-                          {over > 0 && <span className="seg over" style={{ left: `${BUDGET_POS}%`, width: `${over}%` }} />}
-                        </div>
-                        <div className="row-foot num">
-                          {r.status === "over" && <span className="tag tag-red">{money(diff, sym)} over</span>}
-                          {r.status === "unbudgeted" && <span className="tag tag-red">unbudgeted spend</span>}
-                          {r.status === "caution" && <span className="tag tag-amber">{money(r.budget - r.spent, sym)} left</span>}
-                          {r.status === "ok" && r.spent > 0 && <span className="tag tag-teal">{money(r.budget - r.spent, sym)} left</span>}
-                          {r.status === "ok" && r.spent === 0 && <span className="tag tag-faint">nothing spent</span>}
-                          {r.status === "tracked" && <span className="tag tag-faint">{r.spent > 0 ? "tracked · not counted" : "nothing this month"}</span>}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            );
-          })}
-        </section>
-
-        {/* sidebar */}
-        <aside className="side">
-          <section className="panel">
-            <div className="panel-head"><h2>Cash flow · {monthLabel(selMonth, { month: "short", year: "numeric" })}</h2></div>
-            <div className="cf">
-              <div className="cf-line"><span>Budget</span><span className="num">{money(totalBudget, sym)}</span></div>
-              <div className="cf-line"><span>Spent</span><span className="num fig-over">− {money(totalSpent, sym)}</span></div>
-              <div className="cf-line cf-net">
-                <span>{remaining < 0 ? "Over budget" : "Remaining"}</span>
-                <span className={`num ${remaining < 0 ? "fig-over" : "fig-good"}`}>{money(remaining, sym)}</span>
-              </div>
-              <p className="cf-note">
-                {remaining >= 0
-                  ? `${money(remaining, sym)} left in this month's budget.`
-                  : `Over budget by ${money(-remaining, sym)} this month.`}
-              </p>
-            </div>
-          </section>
-
-          <section className="panel">
-            <div className="panel-head"><h2>6-month trend</h2></div>
-            <div className="chart">
-              <ResponsiveContainer width="100%" height={180}>
-                <ComposedChart data={trend} margin={{ top: 6, right: 4, left: -14, bottom: 0 }}>
-                  <XAxis dataKey="label" tick={{ fontSize: 11, fill: "var(--muted)" }} axisLine={false} tickLine={false} />
-                  <YAxis tick={{ fontSize: 10, fill: "var(--faint)" }} axisLine={false} tickLine={false}
-                    tickFormatter={(v) => (v >= 100000 ? `${sym}${(v / 100000).toFixed(1)}L` : v >= 1000 ? `${sym}${Math.round(v / 1000)}k` : `${sym}${v}`)} />
-                  <Tooltip cursor={{ fill: "rgba(0,0,0,0.04)" }}
-                    contentStyle={{ borderRadius: 10, border: "1px solid var(--hairline)", fontSize: 12, fontFamily: "Inter, sans-serif" }}
-                    formatter={(v, n) => [money(v, sym), n === "spent" ? "Spent" : "Budget"]} />
-                  <Legend wrapperStyle={{ fontSize: 11, paddingTop: 4 }} iconType="plainline" />
-                  <Bar dataKey="spent" name="Spent" radius={[4, 4, 0, 0]} maxBarSize={26}>
-                    {trend.map((d, i) => (<Cell key={i} fill={d.budget > 0 && d.spent > d.budget ? "var(--red)" : "var(--teal)"} />))}
-                  </Bar>
-                  <Line dataKey="budget" name="Budget" stroke="var(--ink)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} />
-                </ComposedChart>
-              </ResponsiveContainer>
-            </div>
-            <p className="chart-note">Dashed line is each month's planned budget — it shifts with your annual items (LIC, insurance, etc.). Bars turn red on months you ran over.</p>
-          </section>
-
-          {overRows.length > 0 && (
-            <section className="panel">
-              <div className="panel-head"><h2>Trim these first</h2></div>
-              <ul className="overlist">
-                {overRows.slice().sort((a, b) => (b.budget > 0 ? b.spent - b.budget : b.spent) - (a.budget > 0 ? a.spent - a.budget : a.spent)).map((r) => (
-                  <li key={r.id}><span>{r.name}</span><span className="num fig-over"><ArrowUpRight size={13} strokeWidth={2.5} />{money(r.budget > 0 ? r.spent - r.budget : r.spent, sym)}</span></li>
-                ))}
-              </ul>
-            </section>
-          )}
-        </aside>
+      <div className="cards">
+        <PaceCard fig={fig} catById={catById} selMonth={selMonth} sym={sym} />
+        <BillsCard fig={fig} categories={categories} selMonth={selMonth} sym={sym} />
+      </div>
+      <div className="cards">
+        <BudgetsCard fig={fig} categories={categories} catById={catById} selMonth={selMonth} sym={sym}
+          onPick={pickBudgetRow} onEditBudgets={() => setManageOpen(true)} />
+        <StructureCard fig={fig} catById={catById} sym={sym} />
+      </div>
+      <div className="cards">
+        <CashFlowCard expenses={expenses} catById={catById} income={income} selMonth={selMonth} sym={sym} />
+        <PayeesCard fig={fig} catById={catById} sym={sym} />
+        <SetAsideCard categories={categories} selMonth={selMonth} sym={sym} />
       </div>
 
       {/* entries */}
-      <section className="panel">
+      <section className="panel" ref={entriesRef}>
         <div className="panel-head">
-          <h2>{monthLabel(selMonth, { month: "long" })} entries</h2>
-          {monthExpenses.length === 0 && expenses.length === 0 && (<button className="btn-sample" onClick={loadSample}><Sparkles size={14} /> Load sample month</button>)}
+          <h2>{monthLabel(selMonth, { month: "long" })} entries <span className="sub num">· {monthExpenses.length}</span></h2>
         </div>
         {monthExpenses.length > 0 && (
           <div className="entry-search">
@@ -943,7 +776,7 @@ export default function ExpenseLedger() {
           </div>
         )}
         {monthExpenses.length === 0 ? (
-          <div className="empty">No expenses logged for this month yet.</div>
+          <div className="empty">No expenses logged for this month yet. Use “Add expense” or Import.</div>
         ) : (() => {
           const q = entrySearch.trim().toLowerCase();
           const filtered = monthExpenses.filter((e) => {
@@ -1007,15 +840,26 @@ export default function ExpenseLedger() {
           );
         })()}
       </section>
-
       </>)}
+
+      <button className="fab" onClick={() => setQuickOpen(true)} aria-label="Add expense">
+        <Plus size={22} strokeWidth={2.5} /> <span className="fab-label">Add expense</span>
+      </button>
+
+      {quickOpen && (
+        <QuickAdd categories={categories} expenses={expenses} catPersonMap={catPersonMap} defaultBank={lastBank} sym={sym}
+          onSave={addExpense} onClose={() => setQuickOpen(false)} />
+      )}
 
       {importOpen && (
         <ImportWizard categories={categories} sym={sym} merchantMap={merchantMap} existing={expenses}
           onClose={() => setImportOpen(false)} onImport={onImport} />
       )}
 
-      <footer className="foot">Manali's Ledger · FY 2026–27 · everything you log is saved on this device.</footer>
+      <footer className="foot">
+        Manali's Ledger v{APP_VERSION} · saved to the cloud, nothing kept on this device ·{" "}
+        <span className={`sync${sync === "error" ? " error" : ""}`}>{sync === "saving" ? "Saving…" : sync === "error" ? "Not saved" : "All changes saved"}</span>
+      </footer>
 
       {/* drawer */}
       {manageOpen && (
@@ -2556,5 +2400,7 @@ function Styles() {
 .person-row{display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:4px;}
 .person-btn{border:1px solid var(--border);border-radius:12px;padding:2px 8px;font-size:11px;cursor:pointer;background:transparent;color:var(--ink);line-height:1.6;}
 .person-btn.on{background:var(--teal);color:#fff;border-color:var(--teal);}
-`}</style>);
+` + dashCss}</style>);
 }
+
+export { money, moneySigned, monthLabel, shiftMonth, monthKey, budgetFor, mIdx, todayISO, uid, SECTIONS, NONSPEND_SECTION, SUSPENSE_ID, BANKS, BankOptions };

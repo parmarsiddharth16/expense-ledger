@@ -1,52 +1,42 @@
 import React, { useState, useEffect } from "react";
 import ReactDOM from "react-dom/client";
-import ExpenseLedger, { auth } from "../ExpenseLedger.jsx";
+import ExpenseLedger, { auth, store } from "../ExpenseLedger.jsx";
 
 /*
  * Access gate.
  *
- * This used to compare what you typed against a constant sitting in this file.
- * That constant shipped inside the JavaScript bundle, so it was readable by
- * anyone who opened the page — and it protected nothing anyway, because
- * /api/data answered any request that reached it. The ledger was effectively
- * public to anyone who knew the URL.
- *
- * Now the code is checked by the server: it is sent as the passcode header on a
- * real request, and the ledger renders only if that request is accepted. The
- * passcode itself lives in LEDGER_PASSCODE in the Vercel project and never
- * ships to the browser.
- *
- * Until that variable is set the server accepts everything, so the old local
- * code still opens the app rather than locking anyone out — but the app then
- * shows a standing warning that the ledger is unprotected.
+ * The passcode is checked by the server (LEDGER_PASSCODE in the Vercel
+ * project) and kept in memory only. Nothing is remembered between visits: every
+ * new tab, reload or device asks again, and Log out — or a 401 from the API —
+ * brings this screen straight back with the in-memory ledger dropped.
  */
 
 const LEGACY_CODE = "2602";
-const GATE_KEY = "ledger:gate";
 
 function Gate() {
   const [ok, setOk] = useState(false);
-  const [checking, setChecking] = useState(true);
   const [val, setVal] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [session, setSession] = useState(0); // remounts the app on each unlock
 
-  // A remembered passcode is re-verified on load, so revoking it on the server
-  // actually locks the app rather than leaving old sessions open.
   useEffect(() => {
-    (async () => {
-      try {
-        if (sessionStorage.getItem(GATE_KEY) === "ok" || auth.pass) {
-          const res = await fetch("/api/data", { cache: "no-store", headers: auth.headers() });
-          if (res.ok) { setOk(true); setChecking(false); return; }
-          try { sessionStorage.removeItem(GATE_KEY); } catch {}
-          auth.set("");
-        }
-      } catch {
-        // offline: fall through to the prompt, the app works from its local cache
-      }
-      setChecking(false);
-    })();
+    const lock = (why) => () => {
+      store.reset(); auth.set("");
+      setOk(false); setVal(""); setErr(""); setMsg(why);
+    };
+    const onLogout = lock("You've been logged out.");
+    const onExpired = lock("Please enter the passcode again.");
+    const onReload = () => { store.reset(); setSession((n) => n + 1); };
+    window.addEventListener("ledger:logout", onLogout);
+    window.addEventListener("ledger:needs-passcode", onExpired);
+    window.addEventListener("ledger:reload", onReload);
+    return () => {
+      window.removeEventListener("ledger:logout", onLogout);
+      window.removeEventListener("ledger:needs-passcode", onExpired);
+      window.removeEventListener("ledger:reload", onReload);
+    };
   }, []);
 
   const submit = async (e) => {
@@ -65,8 +55,9 @@ function Gate() {
           auth.set(""); setErr("Incorrect code — try again."); setVal(""); setBusy(false); return;
         }
         if (json && json.protected === false) auth.set("");
-        try { sessionStorage.setItem(GATE_KEY, "ok"); } catch {}
-        setOk(true); setBusy(false); return;
+        store.reset();
+        setSession((n) => n + 1);
+        setOk(true); setVal(""); setMsg(""); setBusy(false); return;
       }
       auth.set("");
       setErr(res.status === 401 ? "Incorrect code — try again." : "Couldn't reach the ledger. Try again.");
@@ -77,58 +68,55 @@ function Gate() {
     setVal(""); setBusy(false);
   };
 
-  if (ok) return <ExpenseLedger />;
+  if (ok) return <ExpenseLedger key={session} />;
 
   const wrap = {
     minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
-    background: "#f6f5f1", fontFamily: "'Inter',system-ui,-apple-system,sans-serif",
+    background: "#ECEFEE", fontFamily: "'Inter',system-ui,-apple-system,sans-serif",
     padding: 20, boxSizing: "border-box",
   };
   const card = {
-    width: "100%", maxWidth: 340, background: "#fff", borderRadius: 18,
-    border: "1px solid #e7e4dd", boxShadow: "0 10px 40px rgba(0,0,0,0.06)",
+    width: "100%", maxWidth: 360, background: "#fff", borderRadius: 18,
+    border: "1px solid #E4E8EA", boxShadow: "0 10px 40px rgba(0,0,0,0.06)",
     padding: "34px 30px", textAlign: "center", boxSizing: "border-box",
   };
   const input = {
     width: "100%", boxSizing: "border-box", marginTop: 18, padding: "13px 14px",
-    fontSize: 22, letterSpacing: "0.4em", textAlign: "center",
-    borderRadius: 12, border: "1.5px solid " + (err ? "#d9534f" : "#dcd8cf"),
-    outline: "none", fontFamily: "inherit", background: "#fbfaf7",
+    fontSize: 20, letterSpacing: "0.25em", textAlign: "center",
+    borderRadius: 12, border: "1.5px solid " + (err ? "#C02942" : "#D5DBDE"),
+    outline: "none", fontFamily: "inherit", background: "#F7F9F9",
   };
   const btn = {
-    width: "100%", boxSizing: "border-box", marginTop: 14, padding: "12px 14px",
+    width: "100%", boxSizing: "border-box", marginTop: 14, padding: "13px 14px", minHeight: 46,
     fontSize: 15, fontWeight: 600, color: "#fff",
-    background: busy ? "#7fb3ad" : "#0f766e",
+    background: busy ? "#6FA89E" : "#0E7C6B",
     border: "none", borderRadius: 12, cursor: busy ? "default" : "pointer", fontFamily: "inherit",
   };
-
-  if (checking) {
-    return <div style={wrap}><div style={{ ...card, color: "#8a857c", fontSize: 14 }}>Checking…</div></div>;
-  }
 
   return (
     <div style={wrap}>
       <form style={card} onSubmit={submit}>
-        <div style={{ fontSize: 30, marginBottom: 6 }}>&#128274;</div>
-        <div style={{ fontSize: 19, fontWeight: 700, color: "#1c1b18",
-          fontFamily: "'Space Grotesk','Inter',sans-serif" }}>Manali's Ledger</div>
-        <div style={{ fontSize: 13, color: "#8a857c", marginTop: 6 }}>
-          Enter the access code to continue
+        <div style={{ width: 44, height: 44, borderRadius: 12, background: "#171B1E", margin: "0 auto 12px", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2" /><path d="M8 11V7a4 4 0 0 1 8 0v4" /></svg>
         </div>
+        <div style={{ fontSize: 20, fontWeight: 700, color: "#171B1E", fontFamily: "'Space Grotesk','Inter',sans-serif" }}>Manali's Ledger</div>
+        <div style={{ fontSize: 13, color: "#6B757D", marginTop: 6 }}>
+          {msg || "Enter the passcode to continue"}
+        </div>
+        <label htmlFor="ledger-pass" style={{ position: "absolute", left: -9999 }}>Passcode</label>
         <input
+          id="ledger-pass"
           style={input}
           type="password"
-          inputMode="numeric"
+          autoComplete="current-password"
           autoFocus
-          placeholder="&#8226;&#8226;&#8226;&#8226;"
+          placeholder="Passcode"
           value={val}
           onChange={(e) => { setVal(e.target.value); if (err) setErr(""); }}
-          aria-label="Access code"
         />
-        {err && (
-          <div style={{ color: "#d9534f", fontSize: 12.5, marginTop: 8 }}>{err}</div>
-        )}
+        {err && <div role="alert" style={{ color: "#C02942", fontSize: 13, marginTop: 8 }}>{err}</div>}
         <button type="submit" style={btn} disabled={busy}>{busy ? "Checking…" : "Unlock"}</button>
+        <div style={{ fontSize: 11.5, color: "#6B757D", marginTop: 14 }}>The passcode isn't remembered — you'll be asked each visit.</div>
       </form>
     </div>
   );
