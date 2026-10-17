@@ -14,8 +14,11 @@ import {
   useMonthFigures, KpiStrip, PaceCard, BillsCard, BudgetsCard, StructureCard,
   CashFlowCard, PayeesCard, SetAsideCard, QuickAdd, HistoryView, dashCss,
 } from "./src/dashboard.jsx";
+import {
+  classifyCredit, creditDupKey, MoneyInReview, IncomeView, incomeCss, monthIncome, dueDayOf, isBillCat, CREDIT_KINDS, ordinal,
+} from "./src/income.jsx";
 
-export const APP_VERSION = "2.0.0";
+export const APP_VERSION = "2.1.0";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -284,6 +287,7 @@ export async function logout() {
 }
 const K_CATS = "ledger:categories", K_EXP = "ledger:expenses", K_SET = "ledger:settings", K_INC = "ledger:income";
 const K_MAP = "ledger:merchantMap", K_STMTS = "ledger:stmts", K_AUDIT = "ledger:audit";
+const K_CREDITS = "ledger:credits", K_CMAP = "ledger:creditMap";
 
 /* Transactions the categoriser would not guess at are parked under this id.
  * It deliberately isn't a real category, so the dashboard already rolls it into
@@ -349,6 +353,9 @@ export default function ExpenseLedger() {
   const [merchantMap, setMerchantMap] = useState({});
   const [stmts, setStmts] = useState({});
   const [auditLog, setAuditLog] = useState([]);
+  const [credits, setCredits] = useState([]);
+  const [creditMap, setCreditMap] = useState({});
+  const [cardDue, setCardDue] = useState({});
   const [apiOpen, setApiOpen] = useState(false); // API reachable without a passcode
   const [sync, setSync] = useState("idle");
 
@@ -379,6 +386,8 @@ export default function ExpenseLedger() {
       const mmap = (await store.get(K_MAP)) || {};
       const stmtsData = (await store.get(K_STMTS)) || {};
       const auditData = (await store.get(K_AUDIT)) || [];
+      const creditData = (await store.get(K_CREDITS)) || [];
+      const cmapData = (await store.get(K_CMAP)) || {};
 
       if (ver !== CAT_VERSION || !cats || !cats.length) {
         const oldName = {};
@@ -414,6 +423,9 @@ export default function ExpenseLedger() {
       setMerchantMap(mmap);
       setStmts(stmtsData);
       setAuditLog(auditData);
+      setCredits(creditData);
+      setCreditMap(cmapData);
+      setCardDue(settings.cardDue || {});
       setSym(settings.sym || "₹");
       setApiOpen(store.protectedRemote === false);
       setLoading(false);
@@ -429,7 +441,9 @@ export default function ExpenseLedger() {
 
   const saveCats = useCallback((n) => { setCategories(n); store.set(K_CATS, n); }, []);
   const saveExps = useCallback((n) => { setExpenses(n); store.set(K_EXP, n); }, []);
-  const saveSym = useCallback((s) => { setSym(s); store.set(K_SET, { sym: s }); }, []);
+  const saveSym = (s) => { setSym(s); store.set(K_SET, { sym: s, cardDue }); };
+  const saveCardDue = (n) => { setCardDue(n); store.set(K_SET, { sym, cardDue: n }); };
+  const saveCredits = useCallback((n) => { setCredits(n); store.set(K_CREDITS, n); }, []);
   const saveStmts = useCallback((n) => { setStmts(n); store.set(K_STMTS, n); }, []);
   const saveAudit = useCallback((n) => { setAuditLog(n); store.set(K_AUDIT, n); }, []);
 
@@ -484,7 +498,8 @@ export default function ExpenseLedger() {
 
   const totalBudget = fig.budget;
   const totalSpent = fig.spent;
-  const totalIncome = useMemo(() => income.reduce((s, l) => s + (l.monthly[mIdx(selMonth)] || 0), 0), [income, selMonth]);
+  const mi = useMemo(() => monthIncome(credits, selMonth), [credits, selMonth]);
+  const totalIncome = mi.total;
   const net = totalIncome - totalSpent;
   const savingsRate = totalIncome > 0 ? (net / totalIncome) * 100 : 0;
   const overRows = rows.filter((r) => r.status === "over" || r.status === "unbudgeted");
@@ -537,6 +552,8 @@ export default function ExpenseLedger() {
         "ledger:merchantMap": merchantMap,
         "ledger:stmts": stmts,
         "ledger:catPersonMap": catPersonMap,
+        "ledger:credits": credits,
+        "ledger:creditMap": creditMap,
         "ledger:catVersion": CAT_VERSION,
       };
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
@@ -556,10 +573,10 @@ export default function ExpenseLedger() {
     const lines = [
       `📊 *Manali's Ledger — ${mo}*`,
       "",
-      `💰 Income: ${fmt(totalIncome)}`,
+      mi.has ? `💰 Income received: ${fmt(totalIncome)}` : `💰 Income: awaiting bank statements`,
       `📋 Budgeted: ${fmt(totalBudget)}`,
       `💸 Spent: ${fmt(totalSpent)}`,
-      `🏦 Saved: ${fmt(net)} (${savingsRate.toFixed(0)}%)`,
+      ...(mi.has ? [`🏦 Saved: ${fmt(net)} (${savingsRate.toFixed(0)}%)`] : []),
       "",
       "*Category breakdown:*",
     ];
@@ -590,18 +607,21 @@ export default function ExpenseLedger() {
     } catch { alert(text); }
   };
 
-  const onImport = (newExpenses, newMap, bankSource, audit) => {
-    saveExps([...newExpenses, ...expenses]);
+  const onImport = (newExpenses, newMap, bankSource, audit, newCredits = []) => {
+    if (newExpenses.length) saveExps([...newExpenses, ...expenses]);
+    if (newCredits.length) saveCredits([...newCredits, ...credits]);
     if (newMap) { setMerchantMap(newMap); store.set(K_MAP, newMap); }
-    if (bankSource && newExpenses[0]?.date) {
-      const mk = newExpenses[0].date.slice(0, 7);
+    const firstDate = newExpenses[0]?.date || newCredits[0]?.date;
+    if (bankSource && firstDate) {
+      const mk = firstDate.slice(0, 7);
       const cur = stmts[mk] || [];
       if (!cur.includes(bankSource)) saveStmts({ ...stmts, [mk]: [...cur, bankSource] });
     }
     if (audit) saveAudit([audit, ...auditLog].slice(0, 300));
     setImportOpen(false);
-    if (newExpenses[0]?.date) setSelMonth(newExpenses[0].date.slice(0, 7));
+    if (firstDate) setSelMonth(firstDate.slice(0, 7));
     if (audit?.suspense) setView("suspense");
+    else if (newCredits.some((c) => c.kind === "unsure")) setView("income");
   };
 
   /* Clearing a Suspense row is the moment merchant memory learns something —
@@ -620,6 +640,28 @@ export default function ExpenseLedger() {
       note: row.note, amount: row.amount, bank: row.bank,
       to: categories.find((c) => c.id === catId)?.name || catId,
     }, ...auditLog].slice(0, 300));
+  };
+
+  /* Sorting a credit teaches the ledger that payer for next time (bank accounts only —
+   * card-statement credits are always bill payments or refunds). */
+  const setCreditKind = (id, kind) => {
+    const c = credits.find((x) => x.id === id);
+    if (!c) return;
+    saveCredits(credits.map((x) => (x.id === id ? { ...x, kind, prov: "manual" } : x)));
+    const mk = merchantKey(c.note);
+    if (mk && BANKS.find((b) => b.key === c.bank)?.mode !== "card") {
+      const m = { ...creditMap, [mk]: kind }; setCreditMap(m); store.set(K_CMAP, m);
+    }
+  };
+  const addCredit = (c) => saveCredits([c, ...credits]);
+  const delCredit = (id) => {
+    const c = credits.find((x) => x.id === id);
+    if (c && !window.confirm(`Delete the credit of ${money(c.amount, sym)} on ${c.date}?`)) return;
+    saveCredits(credits.filter((x) => x.id !== id));
+  };
+  const editDueDay = (id, value) => {
+    const d = parseInt(value, 10);
+    saveCats(categories.map((c) => (c.id !== id ? c : (d >= 1 && d <= 31 ? { ...c, dueDay: d } : (({ dueDay, ...rest }) => rest)(c)))));
   };
 
   const editCatAmount = (id, value) => {
@@ -666,7 +708,7 @@ export default function ExpenseLedger() {
   const stmtDone = (stmts[selMonth] || []).filter((k) => STMT_BANKS.some((b) => b.key === k)).length;
   const selIdxLabel = monthLabel(selMonth);
   const tabs = [
-    ["dashboard", "Dashboard"], ["analysis", "Analysis"],
+    ["dashboard", "Dashboard"], ["income", "Income"], ["analysis", "Analysis"],
     ["suspense", "Suspense"], ["history", "History"], ["audit", "Audit"],
   ];
 
@@ -687,6 +729,7 @@ export default function ExpenseLedger() {
           {tabs.map(([k, l]) => (
             <button key={k} className={view === k ? "on" : ""} aria-current={view === k ? "page" : undefined} onClick={() => setView(k)}>
               {l}{k === "suspense" && suspenseRows.length ? <span className="pill-count">{suspenseRows.length}</span> : null}
+              {k === "income" && mi.unsure ? <span className="pill-count">{mi.unsure}</span> : null}
             </button>
           ))}
           <button onClick={() => setManageOpen(true)}>Budgets</button>
@@ -737,12 +780,14 @@ export default function ExpenseLedger() {
         <AuditView log={auditLog} sym={sym} />
       ) : view === "history" ? (
         <HistoryView sym={sym} />
+      ) : view === "income" ? (
+        <IncomeView credits={credits} selMonth={selMonth} sym={sym} onSetKind={setCreditKind} onAdd={addCredit} onDelete={delCredit} />
       ) : (<>
-      <KpiStrip fig={fig} income={totalIncome} sym={sym} selMonth={selMonth} />
+      <KpiStrip fig={fig} mi={mi} sym={sym} selMonth={selMonth} />
 
       <div className="cards">
         <PaceCard fig={fig} catById={catById} selMonth={selMonth} sym={sym} />
-        <BillsCard fig={fig} categories={categories} selMonth={selMonth} sym={sym} />
+        <BillsCard categories={categories} expenses={expenses} credits={credits} cardDue={cardDue} selMonth={selMonth} sym={sym} onSetDue={() => setManageOpen(true)} />
       </div>
       <div className="cards">
         <BudgetsCard fig={fig} categories={categories} catById={catById} selMonth={selMonth} sym={sym}
@@ -750,7 +795,7 @@ export default function ExpenseLedger() {
         <StructureCard fig={fig} catById={catById} sym={sym} />
       </div>
       <div className="cards">
-        <CashFlowCard expenses={expenses} catById={catById} income={income} selMonth={selMonth} sym={sym} />
+        <CashFlowCard expenses={expenses} credits={credits} categories={categories} cardDue={cardDue} catById={catById} selMonth={selMonth} sym={sym} />
         <PayeesCard fig={fig} catById={catById} sym={sym} />
         <SetAsideCard categories={categories} selMonth={selMonth} sym={sym} />
       </div>
@@ -853,6 +898,7 @@ export default function ExpenseLedger() {
 
       {importOpen && (
         <ImportWizard categories={categories} sym={sym} merchantMap={merchantMap} existing={expenses}
+          existingCredits={credits} creditMap={creditMap}
           onClose={() => setImportOpen(false)} onImport={onImport} />
       )}
 
@@ -882,16 +928,39 @@ export default function ExpenseLedger() {
               return (
                 <div className="cat-list" key={sec}>
                   <div className="cat-head"><span>{sec}</span><span>Budget</span><span /></div>
-                  {list.map((c) => (
-                    <div className="cat-edit" key={c.id}>
-                      <input value={c.name} onChange={(e) => editCatName(c.id, e.target.value)} />
-                      <div className="amt-input sm"><span>{sym.trim()}</span><input type="number" min="0" value={c.monthly[mIdx(selMonth)] || 0} onChange={(e) => editCatAmount(c.id, e.target.value)} /></div>
-                      <button className="icon-btn danger" aria-label="Delete" onClick={() => delCategory(c.id)}><Trash2 size={15} /></button>
+                  {list.map((c) => {
+                    const bill = isBillCat(c);
+                    const dd = bill ? dueDayOf({ ...c, dueDay: undefined }, expenses) : null;
+                    return (
+                    <div className="cat-edit-wrap" key={c.id}>
+                      <div className="cat-edit">
+                        <input value={c.name} onChange={(e) => editCatName(c.id, e.target.value)} />
+                        <div className="amt-input sm"><span>{sym.trim()}</span><input type="number" min="0" value={c.monthly[mIdx(selMonth)] || 0} onChange={(e) => editCatAmount(c.id, e.target.value)} /></div>
+                        <button className="icon-btn danger" aria-label="Delete" onClick={() => delCategory(c.id)}><Trash2 size={15} /></button>
+                      </div>
+                      {bill && (
+                        <label className="due-row">Due on day
+                          <input className="due-in" type="number" min="1" max="31" value={c.dueDay || ""} placeholder={dd ? String(dd.day) : "—"} onChange={(e) => editDueDay(c.id, e.target.value)} />
+                          <span>{c.dueDay ? "of the month" : dd ? `(usually paid by the ${ordinal(dd.day)} — leave blank to use that)` : "(not enough history yet)"}</span>
+                        </label>
+                      )}
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               );
             })}
+
+            <div className="cat-list">
+              <div className="cat-head"><span>Credit card payment due dates</span><span /><span /></div>
+              {BANKS.filter((b) => b.mode === "card").map((b) => (
+                <label className="due-row" key={b.key} style={{ paddingLeft: 0 }}>{b.label}: due on day
+                  <input className="due-in" type="number" min="1" max="31" value={cardDue[b.key] || ""} placeholder="—"
+                    onChange={(e) => { const d = parseInt(e.target.value, 10); const n = { ...cardDue }; if (d >= 1 && d <= 31) n[b.key] = d; else delete n[b.key]; saveCardDue(n); }} />
+                  <span>— the bill shown is last month's spend on the card</span>
+                </label>
+              ))}
+            </div>
 
             <button className="btn-ghost full" onClick={addCategory}><Plus size={15} /> Add category</button>
             <div className="drawer-total"><span>Total budget · {monthLabel(selMonth, { month: "short" })}</span><strong className="num">{money(totalBudget, sym)}</strong></div>
@@ -1468,7 +1537,7 @@ function CatSelect({ categories, value, onChange, hint }) {
 /* OLE compound file (D0 CF 11 E0): a legacy .xls, or an encrypted .xlsx wrapper. */
 const isOleFile = (buf) => { const b = new Uint8Array(buf, 0, Math.min(8, buf.byteLength)); return b[0] === 0xd0 && b[1] === 0xcf && b[2] === 0x11 && b[3] === 0xe0; };
 const fileToB64 = (f) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.onerror = () => rej(r.error); r.readAsDataURL(f); });
-function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImport }) {
+function ImportWizard({ categories, sym, merchantMap, existing, existingCredits = [], creditMap = {}, onClose, onImport }) {
   const [step, setStep] = useState("upload");
   const [viaAPI, setViaAPI] = useState(false);
   const [fileName, setFileName] = useState("");
@@ -1506,11 +1575,28 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
   const [diag, setDiag] = useState(null);        // how the statement was read
   const [catSummary, setCatSummary] = useState(null); // how categorisation went
   const [autoBy, setAutoBy] = useState({});      // key -> {layer, confidence, reason, candidates}
+  // Money in: every credit on the statement, sorted into a kind (see src/income.jsx)
+  const [credTx, setCredTx] = useState([]);
+  const [credKinds, setCredKinds] = useState({});
+  const [credInclude, setCredInclude] = useState({});
+  const [credDup, setCredDup] = useState({});
+  const existingCreditKeys = useMemo(() => new Set(existingCredits.map(creditDupKey)), [existingCredits]);
+  const stageCredits = (list, bank) => {
+    const k = {}, inc = {}, dp = {};
+    const out = list.map((t, i) => {
+      const key = "c" + i;
+      const cls = classifyCredit({ ...t, bank }, { creditMap, expenses: existing || [] });
+      const isDup = existingCreditKeys.has(creditDupKey({ ...t, note: t.desc, bank }));
+      k[key] = cls.kind; inc[key] = !isDup; dp[key] = isDup;
+      return { ...t, key, reason: cls.reason };
+    });
+    setCredTx(out); setCredKinds(k); setCredInclude(inc); setCredDup(dp);
+  };
   const dupKey = (date, amount, desc) => `${date}|${Math.round(amount)}|${normMerchant(desc)}`;
   const existingKeys = useMemo(() => new Set((existing || []).map((e) => dupKey(e.date, e.amount, e.note))), [existing]);
 
-  const toReview = (out, fromAPI) => {
-    if (!out.length) { setErr("No expense transactions were found. For tabular files, check the column mapping; for PDFs, try a clearer copy or a CSV/Excel export."); if (fromAPI) setStep("upload"); return; }
+  const toReview = (out, fromAPI, hasCredits = false) => {
+    if (!out.length && !hasCredits) { setErr("No expense transactions were found. For tabular files, check the column mapping; for PDFs, try a clearer copy or a CSV/Excel export."); if (fromAPI) setStep("upload"); return; }
     const asg = {}, inc = {}, dp = {}, by = {};
     out.forEach((t) => {
       const isDup = existingKeys.has(dupKey(t.date, t.amount, t.desc));
@@ -1608,17 +1694,17 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
       setDiag(ex.diagnostics || null);
 
       const debits = (ex.transactions || []).filter((t) => t.kind !== "credit");
-      if (!debits.length) {
-        setErr((ex.transactions || []).length
-          ? "That statement only contained credits — nothing to add as spend."
-          : "No transactions could be read from that statement.");
+      const creds = (ex.transactions || []).filter((t) => t.kind === "credit");
+      if (!debits.length && !creds.length) {
+        setErr("No transactions could be read from that statement.");
         setStep("upload");
         return;
       }
+      stageCredits(creds.map((t) => ({ date: t.date, desc: t.description, amount: t.amount })), bank);
 
       setProgress(`Categorising ${debits.length} transactions…`);
       let results = [];
-      try {
+      if (debits.length) try {
         const cat = await api("/api/categorize", {
           method: "POST",
           body: JSON.stringify({
@@ -1636,7 +1722,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
         key: bank + i, date: t.date, desc: t.description, amount: t.amount,
         auto: results[i] || null,
       }));
-      toReview(list, ex.diagnostics?.source === "claude");
+      toReview(list, ex.diagnostics?.source === "claude", creds.length > 0);
     } catch (ex) {
       console.error(ex);
       setErr(String(ex.message || ex));
@@ -1667,19 +1753,25 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
   const colOpts = headerCells.map((h, i) => ({ i, label: colLabel(i, h) }));
 
   const buildTxns = () => {
-    const out = [];
+    const out = [], creds = [];
     for (let r = headerRow + 1; r < rows.length; r++) {
       const row = rows[r]; if (!row) continue;
       const date = parseDate(row[map.date], dateFmt);
       const desc = String(map.desc >= 0 ? (row[map.desc] ?? "") : "").trim();
-      let amount = NaN;
-      if (amountMode === "split") amount = parseAmount(row[map.debit]);
-      else { const a = parseAmount(row[map.amount]); if (!isNaN(a)) amount = (singleSign === "pos" ? a : -a); }
-      if (isNaN(amount) || amount <= 0) continue;
       if (!desc && !date) continue;
-      out.push({ key: r, date, desc, amount });
+      let amount = NaN, credit = NaN;
+      if (amountMode === "split") {
+        amount = parseAmount(row[map.debit]);
+        if (map.credit >= 0) credit = parseAmount(row[map.credit]);
+      } else {
+        const a = parseAmount(row[map.amount]);
+        if (!isNaN(a)) { amount = (singleSign === "pos" ? a : -a); if (amount < 0) { credit = -amount; amount = NaN; } }
+      }
+      if (!isNaN(amount) && amount > 0) out.push({ key: r, date, desc, amount });
+      else if (!isNaN(credit) && credit > 0 && date) creds.push({ date, desc, amount: credit });
     }
-    toReview(out, false);
+    stageCredits(creds, bankSource);
+    toReview(out, false, creds.length > 0);
   };
 
   const visible = txns.filter((t) => {
@@ -1702,7 +1794,12 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
     // does not block the batch — it goes to Suspense, where it still counts
     // against the month's spend until it is cleared.
     const picked = txns.filter((t) => include[t.key]);
-    if (!picked.length) return;
+    const pickedCredits = credTx.filter((t) => credInclude[t.key]);
+    if (!picked.length && !pickedCredits.length) return;
+    const newCredits = pickedCredits.map((t) => ({
+      id: uid(), date: t.date, amount: t.amount, note: t.desc || "Credit", bank: bankSource,
+      kind: credKinds[t.key], src: "import", prov: credKinds[t.key] === "unsure" ? "unsure" : "auto",
+    }));
 
     const expenses = picked.map((t) => {
       const cat = assign[t.key] || SUSPENSE_ID;
@@ -1741,7 +1838,9 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
       at: new Date().toISOString(),
       bank: bankSource,
       file: fileName,
-      month: expenses[0]?.date?.slice(0, 7) || "",
+      month: (expenses[0]?.date || newCredits[0]?.date || "").slice(0, 7),
+      credits: newCredits.length,
+      income: +newCredits.filter((c) => CREDIT_KINDS[c.kind]?.income).reduce((s, c) => s + c.amount, 0).toFixed(2),
       found: txns.length,
       imported: expenses.length,
       skippedAsDuplicate: txns.filter((t) => dup[t.key] && !include[t.key]).length,
@@ -1759,7 +1858,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
       categoriser: catSummary || null,
     };
 
-    onImport(expenses, newMap, bankSource, audit);
+    onImport(expenses, newMap, bankSource, audit, newCredits);
   };
 
   return (
@@ -1867,7 +1966,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
                   <input type="file" accept=".pdf,.PDF" onChange={handleBOMFile} hidden />
                 </label>
               </div>
-              <div className="imp-note"><Info size={14} /> Password is saved in your browser. Only debits are imported — credits and internal transfers are excluded.</div>
+              <div className="imp-note"><Info size={14} /> Password is saved in your browser. Debits become expenses; credits are recorded under Income (salary and rent count, transfers and refunds don't).</div>
             </div>
             <div className="imp-divider">or</div>
             <div className="sbi-block">
@@ -1885,7 +1984,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
                   <input type="file" accept=".xlsx,.xls,.pdf" onChange={handleUBIFile} hidden />
                 </label>
               </div>
-              <div className="imp-note"><Info size={14} /> Only withdrawals are imported. UBI statements include your own category labels — these appear as descriptions.</div>
+              <div className="imp-note"><Info size={14} /> Withdrawals become expenses and deposits are recorded under Income. UBI statements include your own category labels — these appear as descriptions.</div>
             </div>
             <div className="imp-divider">or</div>
             <div className="sbi-block">
@@ -1903,7 +2002,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
                   <input type="file" accept=".pdf" onChange={handleHDFCBankFile} hidden />
                 </label>
               </div>
-              <div className="imp-note"><Info size={14} /> Password is saved in your browser. Only debits are imported — salary credits and refunds are excluded. CC bill payments appear here AND in CC statements; skip the duplicates in the review step.</div>
+              <div className="imp-note"><Info size={14} /> Password is saved in your browser. Debits become expenses; credits (salary, rent, refunds) are recorded under Income. CC bill payments appear here AND in CC statements; skip the duplicates in the review step.</div>
             </div>
           </div>
         )}
@@ -1953,7 +2052,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
             {amountMode === "split" ? (
               <div className="map-grid">
                 <Field label="Debit / withdrawal (money out)"><ColSelect value={map.debit} opts={colOpts} onChange={(v) => setMap({ ...map, debit: v })} /></Field>
-                <Field label="Credit / deposit (ignored)"><ColSelect value={map.credit} opts={colOpts} onChange={(v) => setMap({ ...map, credit: v })} allowNone /></Field>
+                <Field label="Credit / deposit (recorded as money in)"><ColSelect value={map.credit} opts={colOpts} onChange={(v) => setMap({ ...map, credit: v })} allowNone /></Field>
               </div>
             ) : (
               <div className="map-grid">
@@ -1979,7 +2078,8 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
           const includedCount = txns.filter((t) => include[t.key]).length;
           const uncatCount = txns.filter((t) => include[t.key] && !assign[t.key]).length;
           const autoCount = txns.filter((t) => include[t.key] && assign[t.key] && autoBy[t.key]?.cat === assign[t.key]).length;
-          const canImport = includedCount > 0;
+          const credCount = credTx.filter((t) => credInclude[t.key]).length;
+          const canImport = includedCount > 0 || credCount > 0;
           return (
           <div className="imp-body">
             <div className="rev-summary">
@@ -2057,12 +2157,13 @@ function ImportWizard({ categories, sym, merchantMap, existing, onClose, onImpor
               })}
               {!visible.length && <div className="empty">No transactions match this filter.</div>}
             </div>
+            <MoneyInReview items={credTx} kinds={credKinds} setKinds={setCredKinds} include={credInclude} setInclude={setCredInclude} dup={credDup} sym={sym} />
             <label className="remember"><input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} /> Remember these merchant → category choices and pre-fill them next time</label>
             <div className="imp-actions">
               <button className="btn-ghost" onClick={() => setStep("map")}>Back</button>
               <button className="btn-add" disabled={!canImport} onClick={doImport}>
                 <Check size={16} /> {canImport
-                  ? `Save ${includedCount} expense${includedCount === 1 ? "" : "s"}${uncatCount ? ` (${uncatCount} to Suspense)` : ""}`
+                  ? `Save ${includedCount} expense${includedCount === 1 ? "" : "s"}${uncatCount ? ` (${uncatCount} to Suspense)` : ""}${credCount ? ` + ${credCount} credit${credCount === 1 ? "" : "s"}` : ""}`
                   : "Select transactions above"}
               </button>
             </div>
@@ -2400,7 +2501,11 @@ function Styles() {
 .person-row{display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:4px;}
 .person-btn{border:1px solid var(--border);border-radius:12px;padding:2px 8px;font-size:11px;cursor:pointer;background:transparent;color:var(--ink);line-height:1.6;}
 .person-btn.on{background:var(--teal);color:#fff;border-color:var(--teal);}
-` + dashCss}</style>);
+` + dashCss + incomeCss + `
+.cat-edit-wrap{border-bottom:1px solid var(--hairline); padding-bottom:6px; margin-bottom:6px;}
+.due-row{display:flex; align-items:center; flex-wrap:wrap; gap:6px; font-size:12px; color:var(--muted); padding:4px 0 2px 2px;}
+.due-row input{height:30px; border:1px solid var(--hairline); border-radius:8px; padding:0 8px; font:500 12.5px 'JetBrains Mono',monospace; background:var(--surface); color:var(--ink);}
+`}</style>);
 }
 
 export { money, moneySigned, monthLabel, shiftMonth, monthKey, budgetFor, mIdx, todayISO, uid, SECTIONS, NONSPEND_SECTION, SUSPENSE_ID, BANKS, BankOptions };

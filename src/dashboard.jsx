@@ -7,6 +7,7 @@ import {
   SECTIONS, NONSPEND_SECTION, SUSPENSE_ID, BANKS, BankOptions, api, store,
 } from "../ExpenseLedger.jsx";
 import { merchantKey } from "../api/_lib/categorize.js";
+import { billsForMonth, monthIncome, typicalDay, ordinal, CREDIT_KINDS, isIncome, BILL_SECTIONS, NOT_A_BILL } from "./income.jsx";
 
 /*
  * Dashboard v2 — Wallet-style cards, a YNAB-style "Available" bubble on every
@@ -18,9 +19,6 @@ import { merchantKey } from "../api/_lib/categorize.js";
  * income) the card says what it's based on.
  */
 
-/* Sections whose categories are bills paid on a schedule, not day-to-day spend. */
-const BILL_SECTIONS = ["Household Fixed", "Utilities", "Annual", "Insurance", "LIC Policies"];
-const NOT_A_BILL = /grocery|flower|laundry/i;
 const FIXED_SECTIONS = ["Household Fixed", "Annual", "Insurance", "LIC Policies"];
 const YEARLY_SECTIONS = ["Annual", "Insurance", "LIC Policies"];
 
@@ -58,19 +56,24 @@ export function useMonthFigures({ expenses, categories, catById, selMonth }) {
 /* ------------------------------------------------------------------ */
 /*  KPI strip                                                          */
 /* ------------------------------------------------------------------ */
-export function KpiStrip({ fig, income, sym, selMonth }) {
+export function KpiStrip({ fig, mi, sym, selMonth }) {
   const today = new Date();
   const cur = monthKey(today);
   const left = fig.budget - fig.spent;
   const daysLeft = selMonth === cur ? daysIn(selMonth) - today.getDate() + 1 : 0;
-  const net = income - fig.spent;
-  const rate = income > 0 ? Math.round((net / income) * 100) : 0;
   const pct = fig.budget > 0 ? Math.round((fig.spent / fig.budget) * 100) : 0;
+  const net = mi.total - fig.spent;
+  const rate = mi.total > 0 ? Math.round((net / mi.total) * 100) : 0;
+  const parts = ["salary", "rent", "interest", "other_income"].filter((k) => mi.byKind[k]).map((k) => `${CREDIT_KINDS[k].label} ${shortAmt(mi.byKind[k], sym)}`);
   const tiles = [
     { label: "Spent", value: money(fig.spent, sym), sub: fig.budget > 0 ? `${pct}% of ${money(fig.budget, sym)} budget` : "No budget this month", tone: pct > 100 ? "red" : "" },
     { label: left < 0 ? "Over budget" : "Left to spend", value: money(left, sym), sub: selMonth === cur ? `${daysLeft} day${daysLeft === 1 ? "" : "s"} to go` : selMonth < cur ? "Month closed" : "Month not started", tone: left < 0 ? "red" : "teal" },
-    { label: "Income (planned)", value: money(income, sym), sub: "From your income plan", tone: "" },
-    { label: net < 0 ? "Overspent" : "Saved", value: moneySigned(net, sym), sub: income > 0 ? `${rate}% savings rate` : "Add income to see savings rate", tone: net < 0 ? "red" : "teal" },
+    mi.has
+      ? { label: "Income received", value: money(mi.total, sym), sub: (parts.join(" · ") || "No income credits") + (mi.unsure ? ` · ${mi.unsure} to sort` : ""), tone: "", warn: mi.unsure > 0 }
+      : { label: "Income received", value: "Awaiting statements", sub: "Traced from credits when this month's bank statements are imported", tone: "pending" },
+    mi.has
+      ? { label: net < 0 ? "Overspent" : "Saved", value: moneySigned(net, sym), sub: mi.total > 0 ? `${rate}% of income` : "No income counted yet", tone: net < 0 ? "red" : "teal" }
+      : { label: "Saved", value: "—", sub: "Shown once income is imported", tone: "pending" },
   ];
   return (
     <section className="kpis" aria-label="Month summary">
@@ -78,7 +81,7 @@ export function KpiStrip({ fig, income, sym, selMonth }) {
         <div className="kpi" key={t.label}>
           <span className="kpi-label">{t.label}</span>
           <span className={`kpi-value num${t.tone ? " t-" + t.tone : ""}`}>{t.value}</span>
-          <span className="kpi-sub">{t.sub}</span>
+          <span className={`kpi-sub${t.warn ? " t-amber" : ""}`}>{t.sub}</span>
         </div>
       ))}
     </section>
@@ -176,41 +179,55 @@ export function PaceCard({ fig, catById, selMonth, sym }) {
 /* ------------------------------------------------------------------ */
 /*  Bills this month                                                   */
 /* ------------------------------------------------------------------ */
-export function BillsCard({ fig, categories, selMonth, sym }) {
-  const cur = monthKey(new Date());
-  const bills = fig.spendCats
-    .filter((c) => BILL_SECTIONS.includes(c.section) && !NOT_A_BILL.test(c.name) && budgetFor(c, selMonth) > 0)
-    .map((c) => {
-      const due = budgetFor(c, selMonth), paid = fig.spentBy[c.id] || 0;
-      const status = paid >= due * 0.9 ? "paid" : paid > 0 ? "part" : selMonth < cur ? "missed" : "due";
-      return { id: c.id, name: c.name, section: c.section, due, paid, status };
-    })
-    .sort((a, b) => (a.status === "paid") - (b.status === "paid") || b.due - a.due);
+export function BillsCard({ categories, expenses, credits, cardDue, selMonth, sym, onSetDue }) {
+  const bills = billsForMonth({ categories, expenses, credits, cardDue, selMonth });
   const total = bills.reduce((s, b) => s + b.due, 0);
   const left = bills.reduce((s, b) => s + Math.max(0, b.due - b.paid), 0);
+  const overdue = bills.filter((b) => b.status === "overdue");
+  const todayMs = Date.parse(new Date().toDateString());
+  const dueIn = (d) => Math.round((Date.parse(d) - todayMs) / 864e5);
 
-  // what's coming in the next three months from the once-a-year items
   const ahead = [];
   for (let i = 1; i <= 3; i++) {
     const k = shiftMonth(selMonth, i);
     const items = categories.filter((c) => YEARLY_SECTIONS.includes(c.section) && budgetFor(c, k) > 0);
     if (items.length) ahead.push({ k, n: items.length, amt: items.reduce((s, c) => s + budgetFor(c, k), 0), names: items.map((c) => c.name) });
   }
-  const pill = { paid: ["Paid", "p-done"], part: ["Part paid", "p-warn"], due: ["Due", "p-ok"], missed: ["Not paid", "p-over"] };
+  const pill = {
+    paid: ["Paid", "p-done"], part: ["Part paid", "p-warn"], overdue: ["Overdue", "p-over"],
+    soon: ["Due soon", "p-warn"], upcoming: ["Due", "p-ok"], nodate: ["Due", "p-ok"],
+  };
+  const when = (b) => {
+    if (b.status === "paid") return "Paid";
+    if (!b.date) return "No due date yet";
+    const n = dueIn(b.date);
+    if (n < 0) return `${-n} day${n === -1 ? "" : "s"} overdue`;
+    if (n === 0) return "Due today";
+    return `Due in ${n} day${n === 1 ? "" : "s"}`;
+  };
 
   return (
     <section className="panel card-bills">
       <div className="card-head">
-        <h2>Bills this month</h2>
+        <h2>Bills &amp; due dates</h2>
         <span className="card-meta num">{money(total, sym)}</span>
       </div>
+      {overdue.length > 0 && (
+        <div className="alert" style={{ marginBottom: 10, padding: "9px 12px", fontSize: 13 }}>
+          {overdue.length} overdue · {money(overdue.reduce((s, b) => s + b.due - b.paid, 0), sym)}
+        </div>
+      )}
       {!bills.length ? <div className="empty">No scheduled bills in {monthLabel(selMonth, { month: "long" })}.</div> : (
         <ul className="bill-list">
           {bills.map((b) => (
-            <li key={b.id}>
+            <li key={b.id} className={b.status === "overdue" ? "is-overdue" : ""}>
+              <span className={`bill-date ${b.status}`} title={b.date ? (b.inferred ? "Due day worked out from when you've paid it before — set it in Budgets" : "Due day you set") : "Set a due day in Budgets"}>
+                <strong>{b.date ? Number(b.date.slice(8, 10)) : "—"}</strong>
+                <span>{monthLabel(selMonth, { month: "short" })}{b.inferred ? "*" : ""}</span>
+              </span>
               <span className="bill-main">
                 <span className="bill-name">{b.name}</span>
-                <span className="bill-sub">{b.section}{b.status === "part" ? ` · ${money(b.paid, sym)} paid` : ""}</span>
+                <span className="bill-sub">{when(b)}{b.status === "part" ? ` · ${money(b.paid, sym)} paid` : ""} · {b.section}</span>
               </span>
               <span className="bill-right">
                 <span className="num bill-amt">{money(b.due, sym)}</span>
@@ -220,7 +237,7 @@ export function BillsCard({ fig, categories, selMonth, sym }) {
           ))}
         </ul>
       )}
-      {bills.length > 0 && <p className="card-note"><strong className="num">{money(left, sym)}</strong> still to pay. A bill counts as paid once its category has 90% of the amount logged.</p>}
+      {bills.length > 0 && <p className="card-note"><strong className="num">{money(left, sym)}</strong> still to pay. * = due day worked out from past payments; set exact days and card due dates in <button type="button" className="link-btn" style={{ padding: 0, minHeight: 0 }} onClick={onSetDue}>Budgets</button>.</p>}
       {ahead.length > 0 && (
         <p className="card-note">Coming up: {ahead.map((a, i) => (
           <span key={a.k}>{i ? "; " : ""}{monthLabel(a.k, { month: "short" })} — {a.n === 1 ? a.names[0] : `${a.n} yearly items`} <span className="num">{money(a.amt, sym)}</span></span>
@@ -332,37 +349,75 @@ export function StructureCard({ fig, catById, sym }) {
 /* ------------------------------------------------------------------ */
 /*  Cash flow — last 6 months                                          */
 /* ------------------------------------------------------------------ */
-export function CashFlowCard({ expenses, catById, income, selMonth, sym }) {
+export function CashFlowCard({ expenses, credits, categories, cardDue, catById, selMonth, sym }) {
   const months = [];
   for (let i = 5; i >= 0; i--) {
     const k = shiftMonth(selMonth, -i);
-    const inc = income.reduce((s, l) => s + (l.monthly[mIdx(k)] || 0), 0);
+    const mi = monthIncome(credits, k);
     const out = expenses.filter((e) => e.date.slice(0, 7) === k && catById[e.cat]?.section !== NONSPEND_SECTION).reduce((s, e) => s + e.amount, 0);
-    months.push({ k, inc, out });
+    months.push({ k, inc: mi.total, has: mi.has, out });
   }
   const max = Math.max(...months.map((m) => Math.max(m.inc, m.out)), 1);
+
+  // Money calendar for the selected month: income on top, bills by due date below.
+  const N = daysIn(selMonth);
+  const today = new Date();
+  const isCur = selMonth === monthKey(today);
+  const ins = credits.filter((c) => c.date.slice(0, 7) === selMonth && isIncome(c.kind));
+  const bills = billsForMonth({ categories, expenses, credits, cardDue, selMonth }).filter((b) => b.date);
+  const pos = (d) => `${((Number(d.slice(8, 10)) - 0.5) / N) * 100}%`;
+  const stillDue = bills.filter((b) => b.status !== "paid");
+  const stillAmt = stillDue.reduce((s, b) => s + Math.max(0, b.due - b.paid), 0);
+  const next = stillDue.filter((b) => b.status !== "overdue").sort((a, b) => a.date.localeCompare(b.date))[0];
+  const salaryDay = typicalDay(credits, "salary");
+  const inSoFar = ins.reduce((s, c) => s + c.amount, 0);
+
   return (
     <section className="panel card-flow">
       <div className="card-head">
-        <h2>Cash flow · 6 months</h2>
-        <span className="legend"><span><i className="sw sw-inc" />Income (planned)</span><span><i className="sw sw-out" />Spent</span></span>
+        <h2>Cash flow</h2>
+        <span className="legend"><span><i className="sw sw-inc" />Income received</span><span><i className="sw sw-out" />Spent</span></span>
       </div>
       <div className="flow-bars">
         {months.map((m) => {
           const saved = m.inc - m.out;
           return (
             <div className={`flow-col${m.k === selMonth ? " sel" : ""}`} key={m.k}>
-              <span className={`flow-saved num ${saved < 0 ? "t-red" : "t-teal"}`}>{m.out ? (saved < 0 ? "−" : "") + shortAmt(saved, sym) : "—"}</span>
+              <span className={`flow-saved num ${saved < 0 ? "t-red" : "t-teal"}`}>{m.has && m.out ? (saved < 0 ? "−" : "") + shortAmt(saved, sym) : "—"}</span>
               <div className="flow-pair">
-                <span className="flow-bar inc" style={{ height: `${(m.inc / max) * 120}px` }} title={`Income ${money(m.inc, sym)}`} />
-                <span className={`flow-bar out${m.out > m.inc ? " over" : ""}`} style={{ height: `${(m.out / max) * 120}px` }} title={`Spent ${money(m.out, sym)}`} />
+                {m.has
+                  ? <span className="flow-bar inc" style={{ height: `${(m.inc / max) * 120}px` }} title={`Income ${money(m.inc, sym)}`} />
+                  : <span className="flow-none" title="No bank statements imported for this month">no<br />stmt</span>}
+                <span className="flow-bar out" style={{ height: `${(m.out / max) * 120}px` }} title={`Spent ${money(m.out, sym)}`} />
               </div>
               <span className="flow-m">{monthLabel(m.k, { month: "short" })}</span>
             </div>
           );
         })}
       </div>
-      <p className="card-note">The figure above each month is what was left over. Income uses your income plan until actual credits are imported.</p>
+
+      <div className="card-head" style={{ marginTop: 18, marginBottom: 0 }}>
+        <h2 style={{ fontSize: 14 }}>Money calendar · {monthLabel(selMonth, { month: "long" })}</h2>
+      </div>
+      <div className="tl" role="img" aria-label={`Income on ${ins.map((c) => c.date.slice(8, 10)).join(", ") || "no days yet"}; bills due on ${bills.map((b) => `${b.date.slice(8, 10)} ${b.name}`).join(", ")}`}>
+        <span className="tl-axis" />
+        {isCur && <span className="tl-today" style={{ left: `${((today.getDate() - 0.5) / N) * 100}%` }} title="Today" />}
+        {ins.map((c) => <span key={c.id} className="tl-mark in" style={{ left: pos(c.date) }} title={`${c.date.slice(8, 10)}: +${money(c.amount, sym)} ${CREDIT_KINDS[c.kind].label}`} />)}
+        {bills.map((b) => <span key={b.id} className={`tl-mark out ${b.status}`} style={{ left: pos(b.date) }} title={`${b.date.slice(8, 10)}: ${b.name} ${money(b.due, sym)} · ${b.status}`} />)}
+        {[1, 8, 15, 22, N].map((d) => <span key={d} className="tl-lbl" style={{ left: `${((d - 0.5) / N) * 100}%` }}>{d}</span>)}
+      </div>
+      <div className="tl-legend">
+        <span><i style={{ background: "var(--teal)" }} />Income in</span>
+        <span><i style={{ background: "var(--red)" }} />Overdue</span>
+        <span><i style={{ background: "var(--amber)" }} />Due in 7 days</span>
+        <span><i style={{ background: "var(--ink)" }} />Due later</span>
+        <span><i style={{ background: "#B9C1C6" }} />Paid</span>
+      </div>
+      <p className="card-note">
+        {inSoFar ? <>Income in so far: <strong className="num">{money(inSoFar, sym)}</strong>. </> : <>No income recorded for this month yet. </>}
+        {stillDue.length ? <>Still to go out: <strong className="num">{money(stillAmt, sym)}</strong> across {stillDue.length} bill{stillDue.length === 1 ? "" : "s"}{next ? <> — next is {next.name} on the {ordinal(Number(next.date.slice(8, 10)))}</> : null}. </> : <>All dated bills are paid. </>}
+        {salaryDay ? <>Salary usually lands around the {ordinal(salaryDay)}.</> : null}
+      </p>
     </section>
   );
 }
@@ -696,7 +751,7 @@ export function HistoryView({ sym }) {
 /*  Styles for the cards above                                         */
 /* ------------------------------------------------------------------ */
 export const dashCss = `
-.ledger-root{max-width:1320px;}
+.ledger-root{max-width:1320px; padding-bottom:110px;}
 .t-red{color:var(--red)!important;} .t-teal{color:var(--teal)!important;}
 .mast2{display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px 16px; margin-bottom:18px;}
 .navtabs{display:flex; flex-wrap:wrap; gap:2px; background:var(--surface); border:1px solid var(--hairline); border-radius:12px; padding:4px;}
@@ -719,6 +774,7 @@ export const dashCss = `
 .kpi-label{font-size:11.5px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--muted);}
 .kpi-value{font-size:26px; font-weight:600;}
 .kpi-sub{font-size:12.5px; color:var(--muted);}
+.kpi-value.t-pending{font-family:Inter,sans-serif; font-size:17px; color:var(--muted); font-weight:600; padding:6px 0 3px;}
 
 .cards{display:flex; flex-wrap:wrap; gap:16px; margin-bottom:16px; align-items:flex-start;}
 .cards > .panel{border-radius:16px; padding:18px 20px; min-width:0;}
