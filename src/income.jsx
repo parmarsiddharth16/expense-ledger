@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useEffect } from "react";
 import { Info, Search } from "lucide-react";
 import {
   money, monthLabel, shiftMonth, monthKey, budgetFor, uid, BANKS, NONSPEND_SECTION,
@@ -218,17 +218,30 @@ export function MoneyInReview({ items, kinds, setKinds, include, setInclude, dup
   );
 }
 
+/* A credit's own remark ("Loan from Saryu"), kept apart from the bank's text,
+ * which the duplicate check relies on. Saves when the field loses focus. */
+function RemarkInput({ value, onSave }) {
+  const [v, setV] = useState(value);
+  useEffect(() => setV(value), [value]);
+  const commit = () => { const t = v.trim(); if (t !== value) onSave(t); };
+  return (
+    <input className="cl-remark" placeholder="Add a remark…" value={v} aria-label="Remark"
+      onChange={(e) => setV(e.target.value)} onBlur={commit}
+      onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); if (e.key === "Escape") { setV(value); } }} />
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /*  Income tab                                                         */
 /* ------------------------------------------------------------------ */
-export function IncomeView({ credits, selMonth, sym, onSetKind, onSetCat, onAdd, onDelete, categories = [] }) {
+export function IncomeView({ credits, selMonth, sym, onSetKind, onSetCat, onSetRemark, onAdd, onDelete, categories = [] }) {
   const [q, setQ] = useState("");
   const [showAll, setShowAll] = useState(false);
   const [form, setForm] = useState({ date: `${selMonth}-01`, amount: "", note: "", kind: "other_income", bank: "cash" });
   const mi = monthIncome(credits, selMonth);
   const rows = credits.filter((c) => periodOf(c.date) === selMonth)
     .filter((c) => showAll || c.kind !== "card_payment")
-    .filter((c) => !q || (c.note || "").toLowerCase().includes(q.toLowerCase()))
+    .filter((c) => !q || `${c.remark || ""} ${c.note || ""}`.toLowerCase().includes(q.toLowerCase()))
     .sort((a, b) => (a.kind === "unsure" ? -1 : 0) - (b.kind === "unsure" ? -1 : 0) || b.date.localeCompare(a.date));
   const months = useMemo(() => { const a = []; for (let i = 5; i >= 0; i--) a.push(shiftMonth(selMonth, -i)); return a; }, [selMonth]);
   const table = months.map((k) => ({ k, ...monthIncome(credits, k) }));
@@ -263,7 +276,9 @@ export function IncomeView({ credits, selMonth, sym, onSetKind, onSetCat, onAdd,
             {rows.map((c) => (
               <li key={c.id} className={c.kind === "unsure" ? "unsure" : ""}>
                 <span className="num cl-date">{c.date.slice(8, 10)} {monthLabel(c.date.slice(0, 7), { month: "short" })}</span>
-                <span className="cl-main"><span className="cl-note">{c.note || "—"}</span><span className="cl-bank">{BANKS.find((b) => b.key === c.bank)?.label || c.bank || "—"}</span></span>
+                <span className="cl-main">
+                  {onSetRemark && <RemarkInput value={c.remark || ""} onSave={(v) => onSetRemark(c.id, v)} />}
+                  <span className="cl-note" title={c.note || ""}>{c.note || "—"}</span><span className="cl-bank">{BANKS.find((b) => b.key === c.bank)?.label || c.bank || "—"}</span></span>
                 <span style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                   <select className={`kind-sel k-${c.kind}`} value={c.kind} onChange={(e) => onSetKind(c.id, e.target.value)} aria-label="What is this credit">
                     {KIND_ORDER.map((k) => <option key={k} value={k}>{CREDIT_KINDS[k].label}</option>)}
@@ -336,6 +351,10 @@ export const incomeCss = `
 .credit-list li.unsure{background:#FFFBF4;}
 .cl-main{display:flex; flex-direction:column; min-width:0;}
 .cl-note{overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.cl-remark{border:1px solid transparent; border-radius:7px; padding:2px 6px; margin:0 0 2px -6px; font:600 13px Inter,sans-serif; color:var(--ink); background:transparent; min-width:0;}
+.cl-remark:hover{border-color:var(--hairline);} .cl-remark:focus{outline:none; border-color:var(--teal); background:var(--surface);}
+.cl-remark::placeholder{color:var(--muted); font-weight:400;}
+.cl-remark:placeholder-shown + .cl-note{font-weight:400;}
 .cl-bank{font-size:11.5px; color:var(--muted);}
 .cl-date{font-size:12px; color:var(--muted);}
 .cl-amt{text-align:right; font-weight:600;}

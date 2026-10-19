@@ -22,7 +22,7 @@ import {
   DrillDown, computeAlerts, AlertsStrip, BalancesCard, GoalsCard, TagsView, SplitModal, CalendarView, AskView, featuresCss, parseTags,
 } from "./src/features.jsx";
 
-export const APP_VERSION = "2.2.0";
+export const APP_VERSION = "2.2.1";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -490,7 +490,7 @@ export default function ExpenseLedger() {
     ...expenses,
     ...credits.filter((c) => c.kind === "refund" && c.cat).map((c) => ({
       id: "rf:" + c.id, creditId: c.id, cat: c.cat, amount: -c.amount, date: c.date,
-      note: "Refund · " + (c.note || ""), bank: c.bank, refund: true,
+      note: "Refund · " + (c.remark ? c.remark + " · " : "") + (c.note || ""), bank: c.bank, refund: true,
     })),
   ], [expenses, credits]);
   const monthExpenses = useMemo(() => allExp.filter((e) => periodOf(e.date) === selMonth), [allExp, selMonth]);
@@ -704,6 +704,7 @@ export default function ExpenseLedger() {
     }
   };
   const addCredit = (c) => saveCredits([c, ...credits]);
+  const setCreditRemark = (id, remark) => saveCredits(credits.map((x) => (x.id === id ? { ...x, remark: remark || undefined } : x)));
   const setCreditCat = (id, cat) => saveCredits(credits.map((x) => (x.id === id ? { ...x, cat: cat || undefined } : x)));
   /* Split one entry into several, one per category. The parts keep the date,
    * note, account and tags, and remember which entry they came from. */
@@ -843,7 +844,7 @@ export default function ExpenseLedger() {
       ) : view === "history" ? (
         <HistoryView sym={sym} />
       ) : view === "income" ? (
-        <IncomeView credits={credits} selMonth={selMonth} sym={sym} onSetKind={setCreditKind} onSetCat={setCreditCat} onAdd={addCredit} onDelete={delCredit} categories={categories} />
+        <IncomeView credits={credits} selMonth={selMonth} sym={sym} onSetKind={setCreditKind} onSetCat={setCreditCat} onSetRemark={setCreditRemark} onAdd={addCredit} onDelete={delCredit} categories={categories} />
       ) : view === "calendar" ? (
         <CalendarView allExp={allExp} credits={credits} categories={categories} expenses={allExp} cardDue={cardDue} balances={balances} catById={catById} selMonth={selMonth} sym={sym} />
       ) : view === "tags" ? (

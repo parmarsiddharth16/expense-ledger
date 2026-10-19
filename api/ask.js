@@ -54,7 +54,7 @@ export function buildContext(data, { monthStart = 1, today }) {
 
   lines.push("", "## Money in (ledger month | date | amount | kind | note | account)");
   for (const c of credits.filter((c) => c.date >= since).sort((a, b) => a.date.localeCompare(b.date))) {
-    lines.push(`${periodOf(c.date, monthStart)} | ${c.date} | ${r(c.amount)} | ${c.kind} | ${String(c.note || "").slice(0, 50)} | ${c.bank || ""}`);
+    lines.push(`${periodOf(c.date, monthStart)} | ${c.date} | ${r(c.amount)} | ${c.kind} | ${c.remark ? c.remark + " · " : ""}${String(c.note || "").slice(0, 50)} | ${c.bank || ""}`);
   }
 
   const goals = data["ledger:goals"] || [];
