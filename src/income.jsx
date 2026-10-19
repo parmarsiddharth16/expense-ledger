@@ -279,11 +279,14 @@ export function IncomeView({ credits, selMonth, sym, onSetKind, onSetCat, onAdd,
         </>}
 
         <details className="mi-add">
-          <summary>Add money in by hand (cash, a cheque not yet on a statement)</summary>
+          <summary>Add money in by hand (cash, a card payment or refund, a cheque not yet on a statement)</summary>
           <div className="mi-add-row">
             <input type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} aria-label="Date" />
             <input type="number" min="0" placeholder="Amount" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} aria-label="Amount" />
             <input type="text" placeholder="From / note" value={form.note} onChange={(e) => setForm({ ...form, note: e.target.value })} aria-label="Note" />
+            <select value={form.bank} onChange={(e) => setForm({ ...form, bank: e.target.value })} aria-label="Account">
+              {BANKS.map((b) => <option key={b.key} value={b.key}>{b.label}</option>)}
+            </select>
             <select value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value })} aria-label="Kind">
               {KIND_ORDER.filter((k) => k !== "unsure").map((k) => <option key={k} value={k}>{CREDIT_KINDS[k].label}</option>)}
             </select>

@@ -63,7 +63,9 @@ const SECTIONS = [
  * and transfers between our own accounts. Filed and visible like any category,
  * but left out of Spent, budget use, savings and the over-budget alerts. */
 const NONSPEND_SECTION = "Claims & Transfers";
-const NONSPEND_SEED = ["Claim", "Internal TRF"];
+const NONSPEND_SEED = ["Claim", "Internal TRF", "Investments", "GST (business)", "Reimbursement – Manali"];
+/* Spend categories added after the ledger was first seeded: [name, section]. */
+const SPEND_ADDITIONS = [["Bank charges", "Personal"]];
 /* Old category names → new names (for data migration on reseed) */
 const LEGACY_NAMES = {
   // v2→v3
@@ -302,7 +304,7 @@ const CAT_VERSION = 6;
 
 const BANKS = [
   { key: "hdfc_regalia",  label: "HDFC Regalia CC",       auto: false, mode: "card" },
-  { key: "hdfc_solitaire",label: "HDFC Solitaire CC",      auto: false, mode: "card" },
+  { key: "hdfc_solitaire",label: "HDFC MoneyBack CC",      auto: false, mode: "card" }, // key kept from when it was labelled Solitaire
   { key: "bom",           label: "Bank of Maharashtra",    auto: true,  mode: "savings" },
   { key: "ubi",           label: "Union Bank of India",    auto: true,  mode: "savings" },
   { key: "hdfc_bank",     label: "HDFC Bank (Savings)",    auto: true,  mode: "savings" },
@@ -424,6 +426,11 @@ export default function ExpenseLedger() {
       }
       if (!inc) { inc = buildIncome(); await store.set(K_INC, inc); }
       const missingNS = NONSPEND_SEED.filter((nm) => !cats.some((c) => c.name === nm));
+      const missingSp = SPEND_ADDITIONS.filter(([nm]) => !cats.some((c) => c.name === nm));
+      if (missingSp.length) {
+        cats = [...cats, ...missingSp.map(([name, section]) => ({ id: uid(), name, section, recurring: true, monthly: flat(0) }))];
+        if (!missingNS.length) await store.set(K_CATS, cats);
+      }
       if (missingNS.length) {
         cats = [...cats, ...missingNS.map((name) => ({ id: uid(), name, section: NONSPEND_SECTION, recurring: true, monthly: flat(0) }))];
         await store.set(K_CATS, cats);
@@ -2049,7 +2056,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
               <div className="sbi-row" style={{ flexWrap: "wrap", gap: 8 }}>
                 <select className="sbi-pwd" style={{ flex: "0 0 auto", width: "auto" }} value={ccCardType} onChange={(e) => { setCcCardType(e.target.value); setCcPwd(loadPwd(e.target.value, "ledger:ccPwd")); }}>
                   <option value="hdfc_regalia">Regalia (SIDD0971)</option>
-                  <option value="hdfc_solitaire">Solitaire (SARY5172)</option>
+                  <option value="hdfc_solitaire">MoneyBack (SARY5172)</option>
                 </select>
                 <input
                   type="password"
