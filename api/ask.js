@@ -39,8 +39,8 @@ export function buildContext(data, { monthStart = 1, today }) {
 
   const lines = [];
   lines.push(`Today: ${now}. Ledger months ${monthStart === 1 ? "are calendar months" : `start on day ${monthStart} (a month "YYYY-MM" runs from day ${monthStart} of that month)`}.`);
-  lines.push("", "## Categories (section | name | budget for each calendar month Jan..Dec of the current financial year | due day)");
-  for (const c of cats) lines.push(`${c.section} | ${c.name} | ${(c.monthly || []).map(r).join(",")}${c.dueDay ? ` | due ${c.dueDay}` : ""}`);
+  lines.push("", "## Categories (section | name | budget for each calendar month Jan..Dec of the current financial year | due day | bill frequency)");
+  for (const c of cats) lines.push(`${c.section} | ${c.name} | ${(c.monthly || []).map(r).join(",")}${c.dueDay ? ` | due ${c.dueDay}` : ""}${c.freq ? ` | ${c.freq}${c.dueMonth ? ` (falls due in month ${c.dueMonth} of its cycle)` : ""}${c.billAmt ? ` ${r(c.billAmt)} each` : ""}` : ""}`);
 
   lines.push("", "## Expenses, last 12 months (ledger month | date | amount | category | note | account | people | tags)");
   const rows = exps.filter((e) => e.date >= since).sort((a, b) => a.date.localeCompare(b.date));

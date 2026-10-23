@@ -92,7 +92,136 @@ export function typicalDay(credits, kind) {
 /* ------------------------------------------------------------------ */
 export const BILL_SECTIONS = ["Household Fixed", "Utilities", "Annual", "Insurance", "LIC Policies"];
 export const NOT_A_BILL = /grocery|flower|laundry/i;
-export const isBillCat = (c) => c && BILL_SECTIONS.includes(c.section) && !NOT_A_BILL.test(c.name);
+/* How often a bill falls due, in months. A category can carry:
+ *   freq      one of these keys, or "none" (explicitly not a bill)
+ *   dueDay    1–31
+ *   dueMonth  1–12 — any month in which it falls due (anchors non-monthly cycles)
+ *   billAmt   amount of each bill, for non-monthly bills
+ *   autopay   true when debited automatically
+ * Categories without `freq` keep the old behaviour (bill by section, monthly). */
+export const FREQS = { monthly: 1, bimonthly: 2, quarterly: 3, halfyearly: 6, yearly: 12 };
+export const FREQ_LABEL = { monthly: "Monthly", bimonthly: "Bi-monthly", quarterly: "Quarterly", halfyearly: "Half-yearly", yearly: "Yearly", none: "Not a bill" };
+export const MONTHS3 = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+export const isBillCat = (c) => !!c && (c.freq ? c.freq !== "none" : BILL_SECTIONS.includes(c.section) && !NOT_A_BILL.test(c.name));
+
+/** Does a bill with a frequency fall due in ledger month k? */
+export function isDueIn(c, k) {
+  const step = FREQS[c.freq];
+  if (!step || step === 1 || !c.dueMonth) return true;
+  const m = Number(k.slice(5, 7));
+  return (((m - c.dueMonth) % step) + step) % step === 0;
+}
+
+/** Months in which a bill falls due, e.g. "Mar · Jun · Sep · Dec". */
+export function dueMonthsLabel(c) {
+  const step = FREQS[c.freq];
+  if (!step || step === 1 || !c.dueMonth) return "";
+  const out = [];
+  for (let m = 1; m <= 12; m++) if ((((m - c.dueMonth) % step) + step) % step === 0) out.push(MONTHS3[m - 1]);
+  return out.join(" · ");
+}
+
+/** Amount of one bill. Non-monthly: the amount set for it, else the year's budget spread over its payments. */
+function billAmountFor(c, k, expenses) {
+  const step = FREQS[c.freq];
+  let amt;
+  if (step && step > 1) amt = c.billAmt > 0 ? c.billAmt : Math.round((c.monthly || []).reduce((s, x) => s + (x || 0), 0) * step / 12);
+  else amt = budgetFor(c, k);
+  if (amt > 0 || !c.freq) return amt;
+  // No budget at all (e.g. a non-spend category): use the last month it was paid.
+  let last = "", sum = 0;
+  for (const e of expenses) if (e.cat === c.id && periodOf(e.date) < k && periodOf(e.date) > last) last = periodOf(e.date);
+  if (last) for (const e of expenses) if (e.cat === c.id && periodOf(e.date) === last) sum += e.amount;
+  return sum;
+}
+
+const normName = (s) => String(s || "").toLowerCase().replace(/[‐-―]/g, "-").replace(/\s+/g, " ").trim();
+const parseFreq = (v) => {
+  const s = String(v || "").toLowerCase().replace(/[^a-z]/g, "");
+  if (!s) return null;
+  if (s.startsWith("notabill") || s === "none" || s === "no") return "none";
+  if (s.startsWith("bimonth") || s === "every2months" || s === "everytwomonths") return "bimonthly";
+  if (s.startsWith("halfyear") || s.startsWith("semiannual")) return "halfyearly";
+  if (s.startsWith("quarter")) return "quarterly";
+  if (s.startsWith("year") || s.startsWith("annual")) return "yearly";
+  if (s.startsWith("month")) return "monthly";
+  return undefined; // unreadable
+};
+const parseMonth = (v) => {
+  if (v === "" || v == null) return null;
+  const n = Number(v);
+  if (Number.isInteger(n) && n >= 1 && n <= 12) return n;
+  const i = MONTHS3.findIndex((m) => String(v).trim().toLowerCase().startsWith(m.toLowerCase()));
+  return i >= 0 ? i + 1 : undefined;
+};
+
+/**
+ * Apply rows from the "Bill Due Dates" sheet (sheet_to_json objects keyed by header).
+ * Matches rows to categories, or to credit cards, by name. Rows with a blank
+ * Frequency are left alone. Returns new categories + cardDue and a report.
+ */
+export function applyDueSheet(rows, categories, cardDue, cards) {
+  const col = (row, re) => { const k = Object.keys(row).find((h) => re.test(h.trim())); return k ? row[k] : ""; };
+  const byName = new Map(categories.map((c) => [normName(c.name), c]));
+  const cardByName = new Map(cards.map((b) => [normName(b.label), b]));
+  const patch = {}, nextCard = { ...cardDue };
+  const report = { bills: 0, notBills: 0, cards: 0, skipped: [], unmatched: [], problems: [] };
+  for (const row of rows) {
+    const name = String(col(row, /^category/i) || "").trim();
+    if (!name) continue;
+    const freq = parseFreq(col(row, /^frequency/i));
+    if (freq === null) { report.skipped.push(name); continue; }
+    if (freq === undefined) { report.problems.push(`${name}: frequency "${col(row, /^frequency/i)}" not understood`); continue; }
+    const dayRaw = col(row, /^due ?day/i);
+    const day = dayRaw === "" ? null : Number(dayRaw);
+    if (day != null && !(Number.isInteger(day) && day >= 1 && day <= 31)) { report.problems.push(`${name}: due day "${dayRaw}" isn't 1–31`); continue; }
+    const card = cardByName.get(normName(name));
+    if (card) {
+      if (freq === "none" || !day) delete nextCard[card.key]; else nextCard[card.key] = day;
+      report.cards++; continue;
+    }
+    const c = byName.get(normName(name));
+    if (!c) { report.unmatched.push(name); continue; }
+    if (freq === "none") { patch[c.id] = { freq: "none", dueDay: undefined, dueMonth: undefined, billAmt: undefined, autopay: undefined }; report.notBills++; continue; }
+    const step = FREQS[freq];
+    const month = parseMonth(col(row, /^due ?month/i));
+    if (month === undefined) { report.problems.push(`${name}: due month "${col(row, /^due ?month/i)}" not understood`); continue; }
+    if (step > 1 && !month) { report.problems.push(`${name}: ${FREQ_LABEL[freq].toLowerCase()} needs a due month`); continue; }
+    const amt = Number(String(col(row, /amount/i)).replace(/[^\d.]/g, ""));
+    const ap = String(col(row, /^autopay/i)).trim().toLowerCase();
+    patch[c.id] = {
+      freq, dueDay: day || undefined, dueMonth: step > 1 ? month : undefined,
+      billAmt: step > 1 && amt > 0 ? amt : undefined,
+      autopay: ap.startsWith("y") ? true : undefined,
+    };
+    report.bills++;
+  }
+  const next = categories.map((c) => {
+    const p = patch[c.id];
+    if (!p) return c;
+    const n = { ...c, ...p };
+    for (const k of Object.keys(p)) if (p[k] === undefined) delete n[k];
+    return n;
+  });
+  return { categories: next, cardDue: nextCard, report };
+}
+
+/** The sheet's rows from the ledger as it stands, for download. */
+export function dueSheetRows(categories, cardDue, cards, sections) {
+  const head = ["Section", "Category", "Planned amount (₹)", "Frequency", "Due day (1–31)", "Due month", "Autopay (Y/N)", "Notes"];
+  const out = [head];
+  const order = (c) => { const i = sections.indexOf(c.section); return i < 0 ? 99 : i; };
+  const cats = [...categories].sort((a, b) => order(a) - order(b));
+  const catRow = (c) => {
+    const step = FREQS[c.freq];
+    const amt = step > 1 ? (c.billAmt || "") : (c.monthly?.[new Date().getMonth()] || "");
+    return [c.section, c.name, amt, c.freq ? FREQ_LABEL[c.freq] : "", c.dueDay || "", c.dueMonth ? MONTHS3[c.dueMonth - 1] : "", c.autopay ? "Y" : (c.freq && c.freq !== "none" ? "N" : ""), ""];
+  };
+  cats.filter((c) => c.section !== NONSPEND_SECTION).forEach((c) => out.push(catRow(c)));
+  for (const b of cards) out.push(["Credit Cards", b.label, "", cardDue[b.key] ? "Monthly" : "", cardDue[b.key] || "", "", "", "Card bill due day"]);
+  cats.filter((c) => c.section === NONSPEND_SECTION).forEach((c) => out.push(catRow(c)));
+  return out;
+}
 
 /** The day of the month a category is usually paid: median over its last 6 months of entries. */
 export function inferDueDay(catId, expenses) {
@@ -135,13 +264,15 @@ export function billsForMonth({ categories, expenses, credits = [], cardDue = {}
 
   const out = [];
   for (const c of categories) {
-    if (!isBillCat(c) || c.section === NONSPEND_SECTION) continue;
-    const due = budgetFor(c, selMonth);
+    if (!isBillCat(c) || (c.section === NONSPEND_SECTION && !c.freq)) continue;
+    if (c.freq && !isDueIn(c, selMonth)) continue;
+    const due = billAmountFor(c, selMonth, expenses);
     if (due <= 0) continue;
     const dd = dueDayOf(c, expenses);
     const date = dd ? dateOnDay(selMonth, dd.day) : null;
     const paid = spentBy[c.id] || 0;
-    out.push({ id: c.id, name: c.name, section: c.section, due, paid, date, inferred: dd?.inferred, kind: "bill", status: status(paid, due, date) });
+    const section = FREQS[c.freq] > 1 ? `${c.section} · ${FREQ_LABEL[c.freq].toLowerCase()}` : c.section;
+    out.push({ id: c.id, name: c.name, section: c.autopay ? `${section} · autopay` : section, due, paid, date, inferred: dd?.inferred, kind: "bill", status: status(paid, due, date) });
   }
   const prev = shiftMonth(selMonth, -1);
   for (const b of BANKS.filter((x) => x.mode === "card")) {

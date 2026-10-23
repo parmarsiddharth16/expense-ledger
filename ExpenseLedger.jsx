@@ -16,13 +16,13 @@ import {
   CashFlowCard, PayeesCard, SetAsideCard, QuickAdd, HistoryView, dashCss,
 } from "./src/dashboard.jsx";
 import {
-  classifyCredit, creditDupKey, MoneyInReview, IncomeView, incomeCss, monthIncome, dueDayOf, isBillCat, CREDIT_KINDS, ordinal, guessRefundCat,
+  classifyCredit, creditDupKey, MoneyInReview, IncomeView, incomeCss, monthIncome, dueDayOf, isBillCat, applyDueSheet, dueSheetRows, dueMonthsLabel, FREQS, FREQ_LABEL, CREDIT_KINDS, ordinal, guessRefundCat,
 } from "./src/income.jsx";
 import {
   DrillDown, computeAlerts, AlertsStrip, BalancesCard, GoalsCard, TagsView, SplitModal, CalendarView, AskView, featuresCss, parseTags,
 } from "./src/features.jsx";
 
-export const APP_VERSION = "2.2.1";
+export const APP_VERSION = "2.3.0";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -730,6 +730,36 @@ export default function ExpenseLedger() {
     saveCats(categories.map((c) => (c.id !== id ? c : (d >= 1 && d <= 31 ? { ...c, dueDay: d } : (({ dueDay, ...rest }) => rest)(c)))));
   };
 
+  /* Bill due dates travel as a spreadsheet: download, fill in, upload. */
+  const [dueMsg, setDueMsg] = useState(null);
+  const CARD_BANKS = BANKS.filter((b) => b.mode === "card");
+  const uploadDueSheet = async (file) => {
+    if (!file) return;
+    try {
+      const wb = XLSX.read(await file.arrayBuffer(), { type: "array" });
+      const name = wb.SheetNames.find((n) => /due/i.test(n) && !/how/i.test(n)) || wb.SheetNames[0];
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[name], { defval: "" });
+      const { categories: next, cardDue: nextCard, report } = applyDueSheet(rows, categories, cardDue, CARD_BANKS);
+      if (!report.bills && !report.notBills && !report.cards) { setDueMsg({ err: true, text: `Nothing to import from "${name}" — is this the Bill Due Dates sheet?` }); return; }
+      saveCats(next); saveCardDue(nextCard);
+      const bits = [`${report.bills} bills`, `${report.notBills} marked not a bill`, `${report.cards} card due days`];
+      const warn = [
+        ...report.problems,
+        ...(report.unmatched.length ? [`No category named: ${report.unmatched.join(", ")}`] : []),
+      ];
+      setDueMsg({ err: warn.length > 0, text: `Imported ${bits.join(" · ")}.`, warn });
+    } catch (err) {
+      setDueMsg({ err: true, text: `Couldn't read that file: ${err.message || err}` });
+    }
+  };
+  const downloadDueSheet = () => {
+    const ws = XLSX.utils.aoa_to_sheet(dueSheetRows(categories, cardDue, CARD_BANKS, SECTIONS));
+    ws["!cols"] = [18, 26, 15, 13, 11, 11, 11, 34].map((w) => ({ wch: w }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Due Dates");
+    XLSX.writeFile(wb, "Bill Due Dates.xlsx");
+  };
+
   const editCatAmount = (id, value) => {
     const v = parseFloat(value) || 0;
     saveCats(categories.map((c) => {
@@ -1022,6 +1052,22 @@ export default function ExpenseLedger() {
               <div className="cur-pills">{CURRENCIES.map((c) => (<button key={c} className={c === sym ? "cur on" : "cur"} onClick={() => saveSym(c)}>{c.trim()}</button>))}</div>
             </div>
 
+            <div className="due-io">
+              <div className="due-io-head"><strong>Bill due dates</strong><span>Frequency, due day and month for each bill, kept in a spreadsheet.</span></div>
+              <div className="due-io-btns">
+                <label className="btn-ghost"><Upload size={15} /> Upload sheet
+                  <input type="file" accept=".xlsx,.xls,.csv" hidden onChange={(e) => { uploadDueSheet(e.target.files?.[0]); e.target.value = ""; }} />
+                </label>
+                <button type="button" className="btn-ghost" onClick={downloadDueSheet}><Download size={15} /> Download current</button>
+              </div>
+              {dueMsg && (
+                <div className={`due-msg${dueMsg.err ? " warn" : ""}`}>
+                  {dueMsg.text}
+                  {(dueMsg.warn || []).map((w) => <div key={w}>• {w}</div>)}
+                </div>
+              )}
+            </div>
+
             {SECTIONS.map((sec) => {
               const list = categories.filter((c) => c.section === sec);
               if (!list.length) return null;
@@ -1041,7 +1087,9 @@ export default function ExpenseLedger() {
                       {bill && (
                         <label className="due-row">Due on day
                           <input className="due-in" type="number" min="1" max="31" value={c.dueDay || ""} placeholder={dd ? String(dd.day) : "—"} onChange={(e) => editDueDay(c.id, e.target.value)} />
-                          <span>{c.dueDay ? "of the month" : dd ? `(usually paid by the ${ordinal(dd.day)} — leave blank to use that)` : "(not enough history yet)"}</span>
+                          <span>{FREQS[c.freq] > 1
+                            ? `· ${FREQ_LABEL[c.freq].toLowerCase()} — ${dueMonthsLabel(c)}${c.billAmt ? ` · ${money(c.billAmt, sym)} each` : ""}`
+                            : c.dueDay ? "of the month" : dd ? `(usually paid by the ${ordinal(dd.day)} — leave blank to use that)` : "(not enough history yet)"}{c.autopay ? " · autopay" : ""}</span>
                         </label>
                       )}
                     </div>
@@ -2632,6 +2680,13 @@ function Styles() {
 .person-btn.on{background:var(--teal);color:#fff;border-color:var(--teal);}
 ` + dashCss + incomeCss + featuresCss + `
 .cat-edit-wrap{border-bottom:1px solid var(--hairline); padding-bottom:6px; margin-bottom:6px;}
+.due-io{background:var(--surface); border:1px solid var(--hairline); border-radius:12px; padding:12px 14px; margin-bottom:14px; font-size:13px;}
+.due-io-head{display:flex; flex-direction:column; gap:2px; margin-bottom:10px;}
+.due-io-head span{font-size:12px; color:var(--muted);}
+.due-io-btns{display:flex; flex-wrap:wrap; gap:8px;}
+.due-io-btns label{cursor:pointer;}
+.due-msg{margin-top:10px; font-size:12px; line-height:1.5; padding:8px 10px; border-radius:8px; background:color-mix(in srgb, var(--teal, #2a9d8f) 12%, transparent);}
+.due-msg.warn{background:color-mix(in srgb, var(--amber, #e9a23b) 16%, transparent);}
 .due-row{display:flex; align-items:center; flex-wrap:wrap; gap:6px; font-size:12px; color:var(--muted); padding:4px 0 2px 2px;}
 .due-row input{height:30px; border:1px solid var(--hairline); border-radius:8px; padding:0 8px; font:500 12.5px 'JetBrains Mono',monospace; background:var(--surface); color:var(--ink);}
 `}</style>);
