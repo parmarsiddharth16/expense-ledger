@@ -39,6 +39,32 @@ Infer the year from the statement period. Copy descriptions verbatim — do not 
 Exclude opening/closing balances, summary totals, and any "amount due" lines.
 If you cannot read it, return [].`;
 
+/* Statement passwords saved in Vercel → Settings → Environment Variables,
+ * one per account: PDF_PWD_HDFC_BANK, PDF_PWD_HDFC_REGALIA, PDF_PWD_SBI_SID …
+ * They stay on the server; they are never returned to the browser or logged. */
+function savedPassword(bank) {
+  const key = String(bank || "");
+  if (!/^[a-z0-9_]{2,32}$/.test(key)) return "";
+  return String(process.env["PDF_PWD_" + key.toUpperCase()] || "").trim();
+}
+
+const isPasswordError = (e) => e instanceof PasswordError || (e && e.code === "BAD_PASSWORD");
+
+async function withPasswords(candidates, open) {
+  let lastErr;
+  for (const p of candidates) {
+    try { return await open(p); }
+    catch (e) { if (!isPasswordError(e)) throw e; lastErr = e; }
+  }
+  throw lastErr;
+}
+
+function passwordMessage(e, hasSaved) {
+  return hasSaved
+    ? "The password saved in Vercel for this account didn't open the file — check it, or type the password here."
+    : (e && e.message) || "This statement is password protected — type its password.";
+}
+
 function salvageJSON(text) {
   if (!text) return [];
   let s = text.replace(/```json/gi, "").replace(/```/g, "").trim();
@@ -68,11 +94,15 @@ export default async function handler(req, res) {
       return;
     }
     const kind = sniff(bytes);
-    const password = String(body.password || "");
+    const typed = String(body.password || "");
+    const saved = savedPassword(body.bank);
+    // Try what was typed first, then the password saved in Vercel for this account.
+    const candidates = [...new Set([typed, saved].filter(Boolean))];
+    if (!candidates.length) candidates.push("");
     const yearHint = Number(body.yearHint) || new Date().getFullYear();
 
     if (isSheetKind(kind)) {
-      await handleSpreadsheet(res, bytes, password, yearHint, t0, kind);
+      await handleSpreadsheet(res, bytes, candidates, yearHint, t0, kind, !!saved);
       return;
     }
     if (kind !== "pdf") {
@@ -82,11 +112,11 @@ export default async function handler(req, res) {
 
     let lines = [], pages = 0;
     try {
-      const out = await extractLines(bytes, password);
+      const out = await withPasswords(candidates, (p) => extractLines(bytes, p));
       lines = out.lines; pages = out.pages;
     } catch (e) {
-      if (e instanceof PasswordError || e.code === "BAD_PASSWORD") {
-        res.status(400).json({ ok: false, error: e.message, needsPassword: true });
+      if (isPasswordError(e)) {
+        res.status(400).json({ ok: false, error: passwordMessage(e, !!saved), needsPassword: true });
         return;
       }
       throw e;
@@ -155,13 +185,13 @@ export default async function handler(req, res) {
 
 /* Excel / CSV statements: decrypt if locked, read the grid, name the columns.
  * Same response shape as the PDF path, so the app treats both identically. */
-async function handleSpreadsheet(res, bytes, password, yearHint, t0, kind) {
+async function handleSpreadsheet(res, bytes, candidates, yearHint, t0, kind, hasSaved) {
   let parsed;
   try {
-    parsed = await parseSpreadsheet(bytes, password, { yearHint });
+    parsed = await withPasswords(candidates, (p) => parseSpreadsheet(bytes, p, { yearHint }));
   } catch (e) {
-    if (e instanceof PasswordError || e.code === "BAD_PASSWORD") {
-      res.status(400).json({ ok: false, error: e.message, needsPassword: true });
+    if (isPasswordError(e)) {
+      res.status(400).json({ ok: false, error: passwordMessage(e, hasSaved), needsPassword: true });
       return;
     }
     throw e;

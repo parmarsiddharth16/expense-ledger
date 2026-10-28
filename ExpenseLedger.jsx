@@ -1903,11 +1903,8 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
   const onBankFile = (bank, pwdValue, pwdKey, optional = false) => async (e) => {
     const f = e.target.files?.[0]; if (!f) return;
     e.target.value = "";
-    const needsPwd = pwdKey !== null && !optional;
-    if (needsPwd && !String(pwdValue || "").trim()) {
-      setErr("Enter the statement password first.");
-      return;
-    }
+    // A blank password is fine: the server falls back to the one saved in
+    // Vercel for this account, and asks for it if there isn't one.
     const pwd = String(pwdValue || "").trim();
     if (pwdKey && pwd) { try { localStorage.setItem(pwdKey, pwd); } catch {} }
     await importStatement(f, bank, pwd);
@@ -2088,11 +2085,11 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
                 <input
                   type="password"
                   className="sbi-pwd"
-                  placeholder="Statement password"
+                  placeholder="Password (blank = use the one saved in Vercel)"
                   value={sbiPwd}
                   onChange={(e) => setSbiPwd(e.target.value)}
                 />
-                <label className="sbi-upload-btn" style={!sbiPwd.trim() ? {opacity:.45,pointerEvents:"none"} : {}}>
+                <label className="sbi-upload-btn">
                   Upload file
                   <input type="file" accept=".xlsx,.xls,.pdf" onChange={handleSBIFile} hidden />
                 </label>
@@ -2110,11 +2107,11 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
                 <input
                   type="password"
                   className="sbi-pwd"
-                  placeholder="Statement password"
+                  placeholder="Password (blank = use the one saved in Vercel)"
                   value={ccPwd}
                   onChange={(e) => setCcPwd(e.target.value)}
                 />
-                <label className="sbi-upload-btn" style={!ccPwd.trim() ? {opacity:.45,pointerEvents:"none"} : {}}>
+                <label className="sbi-upload-btn">
                   Upload .pdf
                   <input type="file" accept=".pdf" onChange={handleCCFile} hidden />
                 </label>
@@ -2164,11 +2161,11 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
                 <input
                   type="password"
                   className="sbi-pwd"
-                  placeholder="Statement password"
+                  placeholder="Password (blank = use the one saved in Vercel)"
                   value={hdfcBankPwd}
                   onChange={(e) => setHdfcBankPwd(e.target.value)}
                 />
-                <label className="sbi-upload-btn" style={!hdfcBankPwd.trim() ? {opacity:.45,pointerEvents:"none"} : {}}>
+                <label className="sbi-upload-btn">
                   Upload .pdf
                   <input type="file" accept=".pdf" onChange={handleHDFCBankFile} hidden />
                 </label>
