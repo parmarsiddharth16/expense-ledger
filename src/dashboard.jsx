@@ -181,8 +181,9 @@ export function PaceCard({ fig, catById, selMonth, sym }) {
 /* ------------------------------------------------------------------ */
 /*  Bills this month                                                   */
 /* ------------------------------------------------------------------ */
-export function BillsCard({ categories, expenses, credits, cardDue, balances, selMonth, sym, onSetDue }) {
-  const bills = billsForMonth({ categories, expenses, credits, cardDue, balances, selMonth });
+export function BillsCard({ categories, expenses, credits, cardDue, balances, selMonth, sym, onSetDue, stmtsComplete = true, stmtsLeft = 0 }) {
+  const bills = billsForMonth({ categories, expenses, credits, cardDue, balances, selMonth, stmtsComplete });
+  const awaiting = bills.filter((b) => b.status === "awaiting");
   const total = bills.reduce((s, b) => s + b.due, 0);
   const left = bills.reduce((s, b) => s + Math.max(0, b.due - b.paid), 0);
   const overdue = bills.filter((b) => b.status === "overdue");
@@ -197,13 +198,13 @@ export function BillsCard({ categories, expenses, credits, cardDue, balances, se
   }
   const pill = {
     paid: ["Paid", "p-done"], part: ["Part paid", "p-warn"], overdue: ["Overdue", "p-over"],
-    soon: ["Due soon", "p-warn"], upcoming: ["Due", "p-ok"], nodate: ["Due", "p-ok"],
+    soon: ["Due soon", "p-warn"], upcoming: ["Due", "p-ok"], nodate: ["Due", "p-ok"], awaiting: ["Awaiting statement", "p-ok"],
   };
   const when = (b) => {
     if (b.status === "paid") return "Paid";
     if (!b.date) return "No due date yet";
     const n = dueIn(b.date);
-    if (n < 0) return `${-n} day${n === -1 ? "" : "s"} overdue`;
+    if (n < 0) return b.status === "awaiting" ? `Was due ${-n} day${n === -1 ? "" : "s"} ago · not in statements yet` : `${-n} day${n === -1 ? "" : "s"} overdue`;
     if (n === 0) return "Due today";
     return `Due in ${n} day${n === 1 ? "" : "s"}`;
   };
@@ -217,6 +218,11 @@ export function BillsCard({ categories, expenses, credits, cardDue, balances, se
       {overdue.length > 0 && (
         <div className="alert" style={{ marginBottom: 10, padding: "9px 12px", fontSize: 13 }}>
           {overdue.length} overdue · {money(overdue.reduce((s, b) => s + b.due - b.paid, 0), sym)}
+        </div>
+      )}
+      {awaiting.length > 0 && (
+        <div className="bill-wait">
+          {awaiting.length} bill{awaiting.length === 1 ? "" : "s"} ({money(awaiting.reduce((s, b) => s + b.due - b.paid, 0), sym)}) past {awaiting.length === 1 ? "its" : "their"} date, but {stmtsLeft} of this month's statements {stmtsLeft === 1 ? "isn't" : "aren't"} in yet. They'll tick off as you import, and only show as overdue if they're still missing after that.
         </div>
       )}
       {!bills.length ? <div className="empty">No scheduled bills in {monthLabel(selMonth, { month: "long" })}.</div> : (
@@ -245,6 +251,131 @@ export function BillsCard({ categories, expenses, credits, cardDue, balances, se
           <span key={a.k}>{i ? "; " : ""}{monthLabel(a.k, { month: "short" })} — {a.n === 1 ? a.names[0] : `${a.n} yearly items`} <span className="num">{money(a.amt, sym)}</span></span>
         ))}.</p>
       )}
+    </section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Savings goal — % of income saved over a window, and where to cut   */
+/* ------------------------------------------------------------------ */
+/* Siddharth's stated goal; used until he edits it, nothing is saved until then. */
+export const DEFAULT_SAVINGS_GOAL = { from: "2026-10", to: "2027-03", amount: 700000, rate: 30 };
+
+export function SavingsGoalCard({ goal, expenses, credits, categories, catById, selMonth, sym, onSave, onOpenBudgets }) {
+  const g = goal || DEFAULT_SAVINGS_GOAL;
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState(g);
+  useEffect(() => { if (!editing) setForm(g); }, [editing, g.from, g.to, g.amount, g.rate]); // eslint-disable-line react-hooks/exhaustive-deps
+  const cur = currentPeriod();
+
+  const months = useMemo(() => {
+    const a = []; for (let k = g.from; k <= g.to && a.length < 36; k = shiftMonth(k, 1)) a.push(k); return a;
+  }, [g.from, g.to]);
+
+  const rows = useMemo(() => months.map((k) => {
+    const mi = monthIncome(credits, k);
+    const spent = expenses.filter((e) => periodOf(e.date) === k && catById[e.cat]?.section !== NONSPEND_SECTION).reduce((s, e) => s + e.amount, 0);
+    const inc = mi.total;
+    const state = k > cur ? "future" : !mi.has || inc <= 0 ? "awaiting" : k === cur ? "running" : "closed";
+    return { k, inc, spent, saved: inc - spent, rate: inc > 0 ? ((inc - spent) / inc) * 100 : 0, state };
+  }), [months, credits, expenses, catById, cur]);
+
+  const counted = rows.filter((r) => r.state === "closed" || r.state === "running");
+  const savedSoFar = counted.reduce((s, r) => s + r.saved, 0);
+  const incSoFar = counted.reduce((s, r) => s + r.inc, 0);
+  const rateSoFar = incSoFar > 0 ? (savedSoFar / incSoFar) * 100 : null;
+  const perMonth = g.amount / months.length;
+  const paceTarget = perMonth * counted.length;
+  const left = Math.max(0, g.amount - savedSoFar);
+  const monthsLeft = rows.filter((r) => r.state === "future" || r.state === "awaiting").length;
+  const needPerMonth = monthsLeft ? left / monthsLeft : 0;
+  const pct = Math.max(0, Math.min(100, (savedSoFar / g.amount) * 100));
+  const pacePct = Math.min(100, (paceTarget / g.amount) * 100);
+  const onTrack = savedSoFar >= paceTarget;
+
+  /* where to cut: last 3 closed months' average against budget, NOGO left out */
+  const cuts = useMemo(() => {
+    const last3 = []; for (let i = 1; i <= 3; i++) last3.push(shiftMonth(cur, -i));
+    return categories
+      .filter((c) => c.section !== NONSPEND_SECTION && !c.nogo)
+      .map((c) => {
+        const avg = last3.reduce((s, k) => s + expenses.filter((e) => e.cat === c.id && periodOf(e.date) === k).reduce((a, e) => a + e.amount, 0), 0) / 3;
+        const bud = last3.reduce((s, k) => s + budgetFor(c, k), 0) / 3;
+        return { id: c.id, name: c.name, avg, bud, over: avg - bud };
+      })
+      .filter((r) => r.over > 500)
+      .sort((a, b) => b.over - a.over)
+      .slice(0, 5);
+  }, [categories, expenses, cur]);
+  const nogoCount = categories.filter((c) => c.nogo).length;
+  const cutTotal = cuts.reduce((s, r) => s + r.over, 0);
+  const gap = Math.max(0, needPerMonth - (counted.length ? savedSoFar / counted.length : 0));
+
+  const save = () => {
+    const n = { from: form.from, to: form.to, amount: Math.round(Number(form.amount) || 0), rate: Math.round(Number(form.rate) || 0) };
+    if (!n.from || !n.to || n.to < n.from || !(n.amount > 0)) return;
+    onSave(n); setEditing(false);
+  };
+
+  return (
+    <section className="panel card-sgoal">
+      <div className="card-head">
+        <h2>Savings goal</h2>
+        <button className="link-btn" onClick={() => setEditing((v) => !v)}>{editing ? "Cancel" : "Edit"}</button>
+      </div>
+      {editing ? (
+        <div className="sg-form">
+          <label>Save <span className="amt-input sm"><span>{sym.trim()}</span><input type="number" min="0" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} aria-label="Target amount" /></span></label>
+          <label>or <input type="number" min="0" max="100" value={form.rate} onChange={(e) => setForm({ ...form, rate: e.target.value })} aria-label="Target % of income" style={{ width: 64 }} /> % of income</label>
+          <label>from <input type="month" value={form.from} onChange={(e) => setForm({ ...form, from: e.target.value })} aria-label="From month" /></label>
+          <label>to <input type="month" value={form.to} onChange={(e) => setForm({ ...form, to: e.target.value })} aria-label="To month" /></label>
+          <button className="btn-add" onClick={save}>Save goal</button>
+        </div>
+      ) : (<>
+        <div className="sg-top">
+          <div>
+            <span className="sg-big num">{money(savedSoFar, sym)}</span>
+            <span className="sg-of"> of {money(g.amount, sym)} · {monthLabel(g.from, { month: "short", year: "2-digit" })}–{monthLabel(g.to, { month: "short", year: "2-digit" })}</span>
+          </div>
+          <span className={`pill-s ${!counted.length ? "p-ok" : onTrack ? "p-done" : "p-over"}`}>{!counted.length ? "Starting" : onTrack ? "On track" : "Behind"}</span>
+        </div>
+        <span className="sg-track" aria-hidden="true"><span style={{ width: `${pct}%` }} /><i style={{ left: `${pacePct}%` }} /></span>
+        <p className="sg-sub">
+          {rateSoFar != null ? <>Saving <strong className={`num ${rateSoFar >= g.rate ? "t-teal" : "t-red"}`}>{Math.round(rateSoFar)}%</strong> of income so far (target {g.rate}%). </> : <>Shown once this period's income is imported. </>}
+          {left > 0 && monthsLeft > 0 ? <>Need <strong className="num">{money(needPerMonth, sym)}</strong>/month for the {monthsLeft} month{monthsLeft === 1 ? "" : "s"} left.</> : left <= 0 ? "Goal reached 🎉" : ""}
+        </p>
+        <div className="sg-months">
+          {rows.map((r) => (
+            <div key={r.k} className={`sg-m ${r.state}${r.k === selMonth ? " is-sel" : ""}`} title={r.state === "awaiting" ? "Income not imported yet" : `Income ${money(r.inc, sym)} · Spent ${money(r.spent, sym)}`}>
+              <span className="sg-mn">{monthLabel(r.k, { month: "short" })}</span>
+              <span className={`sg-mv num ${r.state === "closed" || r.state === "running" ? (r.saved >= perMonth ? "t-teal" : "t-red") : ""}`}>
+                {r.state === "future" ? "—" : r.state === "awaiting" ? "…" : `${Math.round(r.rate)}%`}
+              </span>
+            </div>
+          ))}
+        </div>
+        <div className="sg-cuts">
+          <div className="sg-cuts-head">
+            <strong>Where to cut</strong>
+            <span>last 3 months vs budget{nogoCount ? ` · ${nogoCount} NOGO left out` : ""}</span>
+          </div>
+          {!cuts.length ? <div className="empty" style={{ padding: "8px 0" }}>Nothing is running over budget.</div> : (
+            <ul>
+              {cuts.map((c) => (
+                <li key={c.id}>
+                  <span className="sg-cn">{c.name}</span>
+                  <span className="num sg-cv">{money(c.avg, sym)}<em> / {money(c.bud, sym)}</em></span>
+                  <span className="num sg-co">+{money(c.over, sym)}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <p className="card-note">
+            {cuts.length > 0 && gap > 0 ? <>Bringing these back to budget frees about <strong className="num">{money(cutTotal, sym)}</strong>/month. </> : null}
+            {!nogoCount ? <>Mark essentials as <strong>NOGO</strong> in <button type="button" className="link-btn" style={{ padding: 0, minHeight: 0 }} onClick={onOpenBudgets}>Budgets</button> so they're never suggested here.</> : <>Change NOGO categories in <button type="button" className="link-btn" style={{ padding: 0, minHeight: 0 }} onClick={onOpenBudgets}>Budgets</button>.</>}
+          </p>
+        </div>
+      </>)}
     </section>
   );
 }
@@ -351,7 +482,7 @@ export function StructureCard({ fig, catById, sym }) {
 /* ------------------------------------------------------------------ */
 /*  Cash flow — last 6 months                                          */
 /* ------------------------------------------------------------------ */
-export function CashFlowCard({ expenses, credits, categories, cardDue, balances, catById, selMonth, sym }) {
+export function CashFlowCard({ expenses, credits, categories, cardDue, balances, catById, selMonth, sym, stmtsComplete = true }) {
   const months = [];
   for (let i = 5; i >= 0; i--) {
     const k = shiftMonth(selMonth, -i);
@@ -366,11 +497,11 @@ export function CashFlowCard({ expenses, credits, categories, cardDue, balances,
   const isCur = selMonth === currentPeriod();
   const dates = periodDates(selMonth);
   const ins = credits.filter((c) => periodOf(c.date) === selMonth && isIncome(c.kind));
-  const bills = billsForMonth({ categories, expenses, credits, cardDue, balances, selMonth }).filter((b) => b.date);
+  const bills = billsForMonth({ categories, expenses, credits, cardDue, balances, selMonth, stmtsComplete }).filter((b) => b.date);
   const pos = (d) => `${((dayIndex(d, selMonth) - 0.5) / N) * 100}%`;
   const stillDue = bills.filter((b) => b.status !== "paid");
   const stillAmt = stillDue.reduce((s, b) => s + Math.max(0, b.due - b.paid), 0);
-  const next = stillDue.filter((b) => b.status !== "overdue").sort((a, b) => a.date.localeCompare(b.date))[0];
+  const next = stillDue.filter((b) => b.status !== "overdue" && b.status !== "awaiting").sort((a, b) => a.date.localeCompare(b.date))[0];
   const salaryDay = typicalDay(credits, "salary");
   const inSoFar = ins.reduce((s, c) => s + c.amount, 0);
 
@@ -763,6 +894,32 @@ export const dashCss = `
 .ledger-root{max-width:1320px; padding-bottom:110px;}
 .t-red{color:var(--red)!important;} .t-teal{color:var(--teal)!important;}
 .mast2{display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px 16px; margin-bottom:18px;}
+.card-sgoal .sg-top{display:flex; justify-content:space-between; align-items:flex-start; gap:10px;}
+.sg-big{font-size:24px; font-weight:700; color:var(--ink);} .sg-of{font-size:12.5px; color:var(--muted);}
+.sg-track{position:relative; display:block; height:10px; border-radius:6px; background:var(--bg); margin:10px 0 8px; overflow:visible;}
+.sg-track span{display:block; height:100%; border-radius:6px; background:var(--teal);}
+.sg-track i{position:absolute; top:-3px; width:2px; height:16px; background:var(--ink); border-radius:1px;}
+.sg-sub{font-size:12.5px; color:var(--muted); margin:0 0 10px; line-height:1.5;}
+.sg-sub .t-red{color:var(--red);} .sg-sub .t-teal{color:var(--teal);}
+.sg-months{display:grid; grid-template-columns:repeat(auto-fit,minmax(46px,1fr)); gap:6px; margin-bottom:12px;}
+.sg-m{display:flex; flex-direction:column; align-items:center; gap:2px; padding:6px 2px; border:1px solid var(--hairline); border-radius:9px;}
+.sg-m.is-sel{border-color:var(--ink);} .sg-m.future{opacity:.5;}
+.sg-mn{font-size:10.5px; font-weight:600; text-transform:uppercase; color:var(--muted);}
+.sg-mv{font-size:13px; font-weight:600; color:var(--muted);} .sg-mv.t-teal{color:var(--teal);} .sg-mv.t-red{color:var(--red);}
+.sg-cuts-head{display:flex; justify-content:space-between; align-items:baseline; gap:8px; flex-wrap:wrap; font-size:13px; margin-bottom:4px;}
+.sg-cuts-head span{font-size:11.5px; color:var(--faint);}
+.sg-cuts ul{list-style:none; margin:0; padding:0;}
+.sg-cuts li{display:grid; grid-template-columns:1fr auto auto; gap:10px; align-items:baseline; padding:7px 0; border-top:1px solid var(--hairline); font-size:13px;}
+.sg-cn{overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.sg-cv{color:var(--ink);} .sg-cv em{font-style:normal; color:var(--faint);}
+.sg-co{color:var(--red); font-weight:600; min-width:70px; text-align:right;}
+.sg-form{display:flex; flex-direction:column; gap:10px; font-size:13px; color:var(--muted);}
+.sg-form label{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
+.sg-form input[type=month], .sg-form input[type=number]{font:inherit; padding:6px 8px; border:1px solid var(--hairline); border-radius:8px; background:var(--bg); color:var(--ink);}
+.nogo-row{display:flex; align-items:center; gap:7px; font-size:12px; color:var(--muted); padding:2px 0 4px 2px; cursor:pointer;}
+.nogo-row input{accent-color:var(--ink);}
+.nogo-row.on{color:var(--ink); font-weight:600;}
+.bill-wait{background:var(--bg); color:var(--muted); border-radius:10px; padding:9px 12px; font-size:12.5px; line-height:1.45; margin-bottom:10px;}
 .navtabs{display:flex; flex-wrap:wrap; gap:2px; background:var(--surface); border:1px solid var(--hairline); border-radius:12px; padding:4px;}
 .navtabs button{border:0; background:transparent; border-radius:9px; padding:9px 13px; min-height:38px; font:500 13px Inter,sans-serif; color:var(--ink); cursor:pointer; display:inline-flex; align-items:center; gap:6px;}
 .navtabs button:hover{background:var(--bg);}

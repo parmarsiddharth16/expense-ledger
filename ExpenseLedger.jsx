@@ -13,7 +13,7 @@ import { merchantKey } from "./api/_lib/categorize.js";
 import { periodOf, currentPeriod, setMonthStart, getMonthStart, periodLabel } from "./src/period.js";
 import {
   useMonthFigures, KpiStrip, PaceCard, BillsCard, BudgetsCard, StructureCard,
-  CashFlowCard, PayeesCard, SetAsideCard, QuickAdd, HistoryView, dashCss,
+  CashFlowCard, PayeesCard, SetAsideCard, QuickAdd, HistoryView, dashCss, SavingsGoalCard,
 } from "./src/dashboard.jsx";
 import {
   classifyCredit, creditDupKey, MoneyInReview, IncomeView, incomeCss, monthIncome, dueDayOf, isBillCat, applyDueSheet, dueSheetRows, dueMonthsLabel, FREQS, FREQ_LABEL, CREDIT_KINDS, ordinal, guessRefundCat,
@@ -362,6 +362,7 @@ export default function ExpenseLedger() {
   const [credits, setCredits] = useState([]);
   const [creditMap, setCreditMap] = useState({});
   const [cardDue, setCardDue] = useState({});
+  const [savingsGoal, setSavingsGoal] = useState(null);
   const [goals, setGoals] = useState([]);
   const [balances, setBalances] = useState({});
   const [monthStart, setMonthStartState] = useState(1);
@@ -445,6 +446,7 @@ export default function ExpenseLedger() {
       setCredits(creditData);
       setCreditMap(cmapData);
       setCardDue(settings.cardDue || {});
+      setSavingsGoal(settings.savingsGoal || null);
       setGoals(goalsData);
       setBalances(balData);
       setMonthStart(settings.monthStart || 1);
@@ -465,7 +467,8 @@ export default function ExpenseLedger() {
 
   const saveCats = useCallback((n) => { setCategories(n); store.set(K_CATS, n); }, []);
   const saveExps = useCallback((n) => { setExpenses(n); store.set(K_EXP, n); }, []);
-  const settingsNow = { sym, cardDue, monthStart };
+  const settingsNow = { sym, cardDue, monthStart, ...(savingsGoal ? { savingsGoal } : {}) };
+  const saveSavingsGoal = (g) => { setSavingsGoal(g); store.set(K_SET, { ...settingsNow, savingsGoal: g }); };
   const saveSym = (s) => { setSym(s); store.set(K_SET, { ...settingsNow, sym: s }); };
   const saveCardDue = (n) => { setCardDue(n); store.set(K_SET, { ...settingsNow, cardDue: n }); };
   const saveMonthStart = (n) => {
@@ -769,6 +772,11 @@ export default function ExpenseLedger() {
     }));
   };
   const editCatName = (id, name) => saveCats(categories.map((c) => (c.id === id ? { ...c, name } : c)));
+  /* NOGO = essential; never suggested as a place to cut */
+  const toggleNogo = (id) => saveCats(categories.map((c) => {
+    if (c.id !== id) return c;
+    const n = { ...c }; if (c.nogo) delete n.nogo; else n.nogo = true; return n;
+  }));
   const addCategory = () =>
     saveCats([...categories, { id: uid(), name: "New category", section: "Lifestyle", recurring: true, monthly: flat(0) }]);
   const delCategory = (id) => {
@@ -876,7 +884,7 @@ export default function ExpenseLedger() {
       ) : view === "income" ? (
         <IncomeView credits={credits} selMonth={selMonth} sym={sym} onSetKind={setCreditKind} onSetCat={setCreditCat} onSetRemark={setCreditRemark} onAdd={addCredit} onDelete={delCredit} categories={categories} />
       ) : view === "calendar" ? (
-        <CalendarView allExp={allExp} credits={credits} categories={categories} expenses={allExp} cardDue={cardDue} balances={balances} catById={catById} selMonth={selMonth} sym={sym} />
+        <CalendarView allExp={allExp} credits={credits} categories={categories} expenses={allExp} cardDue={cardDue} balances={balances} catById={catById} selMonth={selMonth} sym={sym} stmtsComplete={stmtDone === STMT_BANKS.length} />
       ) : view === "tags" ? (
         <TagsView allExp={allExp} catById={catById} sym={sym} onOpen={(t) => setDrill({ type: "tag", value: t, label: t })} />
       ) : view === "ask" ? (
@@ -887,19 +895,22 @@ export default function ExpenseLedger() {
 
       <div className="cards">
         <PaceCard fig={fig} catById={catById} selMonth={selMonth} sym={sym} />
-        <BillsCard categories={categories} expenses={allExp} credits={credits} cardDue={cardDue} balances={balances} selMonth={selMonth} sym={sym} onSetDue={() => setManageOpen(true)} />
+        <BillsCard categories={categories} expenses={allExp} credits={credits} cardDue={cardDue} balances={balances} selMonth={selMonth} sym={sym} onSetDue={() => setManageOpen(true)}
+          stmtsComplete={stmtDone === STMT_BANKS.length} stmtsLeft={STMT_BANKS.length - stmtDone} />
       </div>
       <div className="cards">
+        <SavingsGoalCard goal={savingsGoal} expenses={allExp} credits={credits} categories={categories} catById={catById}
+          selMonth={selMonth} sym={sym} onSave={saveSavingsGoal} onOpenBudgets={() => setManageOpen(true)} />
         <BudgetsCard fig={fig} categories={categories} catById={catById} selMonth={selMonth} sym={sym}
           onPick={pickBudgetRow} onEditBudgets={() => setManageOpen(true)} />
-        <StructureCard fig={fig} catById={catById} sym={sym} />
       </div>
       <div className="cards">
-        <CashFlowCard expenses={allExp} credits={credits} categories={categories} cardDue={cardDue} balances={balances} catById={catById} selMonth={selMonth} sym={sym} />
+        <CashFlowCard expenses={allExp} credits={credits} categories={categories} cardDue={cardDue} balances={balances} catById={catById} selMonth={selMonth} sym={sym} stmtsComplete={stmtDone === STMT_BANKS.length} />
         <PayeesCard fig={fig} catById={catById} sym={sym} onPick={setDrill} />
         <SetAsideCard categories={categories} selMonth={selMonth} sym={sym} />
       </div>
       <div className="cards">
+        <StructureCard fig={fig} catById={catById} sym={sym} />
         <BalancesCard balances={balances} credits={credits} sym={sym} onSet={setBalance} />
         <GoalsCard goals={goals} sym={sym} onSave={saveGoals} />
       </div>
@@ -1084,6 +1095,12 @@ export default function ExpenseLedger() {
                         <div className="amt-input sm"><span>{sym.trim()}</span><input type="number" min="0" value={c.monthly[mIdx(selMonth)] || 0} onChange={(e) => editCatAmount(c.id, e.target.value)} /></div>
                         <button className="icon-btn danger" aria-label="Delete" onClick={() => delCategory(c.id)}><Trash2 size={15} /></button>
                       </div>
+                      {sec !== NONSPEND_SECTION && (
+                        <label className={`nogo-row${c.nogo ? " on" : ""}`}>
+                          <input type="checkbox" checked={!!c.nogo} onChange={() => toggleNogo(c.id)} />
+                          NOGO{c.nogo ? " — essential, never suggested as a cut" : ""}
+                        </label>
+                      )}
                       {bill && (
                         <label className="due-row">Due on day
                           <input className="due-in" type="number" min="1" max="31" value={c.dueDay || ""} placeholder={dd ? String(dd.day) : "—"} onChange={(e) => editDueDay(c.id, e.target.value)} />
