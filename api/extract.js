@@ -3,6 +3,7 @@ import { parseStatement } from "./_lib/parse.js";
 import { requirePasscode } from "./_lib/auth.js";
 import { readJsonBody } from "./_lib/blob.js";
 import { summarizeStatement } from "./_lib/summary.js";
+import { readFigures, balancesFromRows } from "./_lib/figures.js";
 import { askClaude } from "./_lib/ai.js";
 import { sniff, isSheetKind, parseSpreadsheet, rowsToCSV } from "./_lib/sheet.js";
 
@@ -46,6 +47,18 @@ function savedPassword(bank) {
   const key = String(bank || "");
   if (!/^[a-z0-9_]{2,32}$/.test(key)) return "";
   return String(process.env["PDF_PWD_" + key.toUpperCase()] || "").trim();
+}
+
+const MODE = { hdfc_regalia: "card", hdfc_solitaire: "card" };
+
+/* What the bank says the statement adds up to, plus what the running balance
+ * says — the audit compares both against the transactions we read. */
+function statementFigures(lineTexts, rows, balanceCheck, bank) {
+  const mode = MODE[bank] || "savings";
+  let printed = {};
+  try { printed = readFigures(lineTexts, { mode }); } catch { printed = { found: {} }; }
+  const derived = balanceCheck ? balancesFromRows(rows, balanceCheck.direction) : {};
+  return { mode, printed, derived };
 }
 
 const isPasswordError = (e) => e instanceof PasswordError || (e && e.code === "BAD_PASSWORD");
@@ -102,7 +115,7 @@ export default async function handler(req, res) {
     const yearHint = Number(body.yearHint) || new Date().getFullYear();
 
     if (isSheetKind(kind)) {
-      await handleSpreadsheet(res, bytes, candidates, yearHint, t0, kind, !!saved);
+      await handleSpreadsheet(res, bytes, candidates, yearHint, t0, kind, !!saved, body.bank);
       return;
     }
     if (kind !== "pdf") {
@@ -177,6 +190,7 @@ export default async function handler(req, res) {
         aiError,
       },
       summary: (() => { try { return summarizeStatement(lines.map((l) => l.text)); } catch { return {}; } })(),
+      figures: statementFigures(lines.map((l) => l.text), source === "claude" ? [] : parsed.transactions, source === "claude" ? null : parsed.balanceCheck, body.bank),
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String((e && e.message) || e) });
@@ -185,7 +199,7 @@ export default async function handler(req, res) {
 
 /* Excel / CSV statements: decrypt if locked, read the grid, name the columns.
  * Same response shape as the PDF path, so the app treats both identically. */
-async function handleSpreadsheet(res, bytes, candidates, yearHint, t0, kind, hasSaved) {
+async function handleSpreadsheet(res, bytes, candidates, yearHint, t0, kind, hasSaved, bank) {
   let parsed;
   try {
     parsed = await withPasswords(candidates, (p) => parseSpreadsheet(bytes, p, { yearHint }));
@@ -247,5 +261,8 @@ async function handleSpreadsheet(res, bytes, candidates, yearHint, t0, kind, has
       ms: Date.now() - t0,
       aiError,
     },
+    figures: statementFigures(
+      parsed.rows.map((r) => (r || []).map((c) => (c && typeof c === "object" ? (c.text ?? c.v ?? "") : (c ?? ""))).join(" ")),
+      source === "claude" ? [] : parsed.transactions, source === "claude" ? null : parsed.balanceCheck, bank),
   });
 }

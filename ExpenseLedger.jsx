@@ -21,6 +21,8 @@ import {
 import {
   DrillDown, computeAlerts, AlertsStrip, BalancesCard, GoalsCard, TagsView, SplitModal, CalendarView, AskView, featuresCss, parseTags,
 } from "./src/features.jsx";
+import { StatementAudit, auditCss } from "./src/auditView.jsx";
+import { makeStatementRecord, upsertStatement } from "./src/audit.js";
 
 export const APP_VERSION = "2.3.0";
 
@@ -294,6 +296,10 @@ export async function logout() {
 const K_CATS = "ledger:categories", K_EXP = "ledger:expenses", K_SET = "ledger:settings", K_INC = "ledger:income";
 const K_MAP = "ledger:merchantMap", K_STMTS = "ledger:stmts", K_AUDIT = "ledger:audit";
 const K_CREDITS = "ledger:credits", K_CMAP = "ledger:creditMap", K_GOALS = "ledger:goals", K_BAL = "ledger:balances";
+/* The statement book: one record per statement (opening, closing, printed
+ * totals and its lines), kept so the audit can re-check it against the ledger
+ * at any time. See src/audit.js. */
+const K_BOOK = "ledger:statements", K_ANOTES = "ledger:auditNotes";
 
 /* Transactions the categoriser would not guess at are parked under this id.
  * It deliberately isn't a real category, so the dashboard already rolls it into
@@ -365,6 +371,8 @@ export default function ExpenseLedger() {
   const [savingsGoal, setSavingsGoal] = useState(null);
   const [goals, setGoals] = useState([]);
   const [balances, setBalances] = useState({});
+  const [stmtBook, setStmtBook] = useState([]);
+  const [auditNotes, setAuditNotes] = useState({});
   const [monthStart, setMonthStartState] = useState(1);
   const [drill, setDrill] = useState(null);
   const [splitting, setSplitting] = useState(null);
@@ -403,6 +411,8 @@ export default function ExpenseLedger() {
       const cmapData = (await store.get(K_CMAP)) || {};
       const goalsData = (await store.get(K_GOALS)) || [];
       const balData = (await store.get(K_BAL)) || {};
+      const bookData = (await store.get(K_BOOK)) || [];
+      const notesData = (await store.get(K_ANOTES)) || {};
 
       if (ver !== CAT_VERSION || !cats || !cats.length) {
         const oldName = {};
@@ -449,6 +459,8 @@ export default function ExpenseLedger() {
       setSavingsGoal(settings.savingsGoal || null);
       setGoals(goalsData);
       setBalances(balData);
+      setStmtBook(Array.isArray(bookData) ? bookData : []);
+      setAuditNotes(notesData);
       setMonthStart(settings.monthStart || 1);
       setMonthStartState(settings.monthStart || 1);
       setSelMonth(currentPeriod());
@@ -484,6 +496,22 @@ export default function ExpenseLedger() {
   const saveCredits = useCallback((n) => { setCredits(n); store.set(K_CREDITS, n); }, []);
   const saveStmts = useCallback((n) => { setStmts(n); store.set(K_STMTS, n); }, []);
   const saveAudit = useCallback((n) => { setAuditLog(n); store.set(K_AUDIT, n); }, []);
+  const saveBook = useCallback((n) => { setStmtBook(n); store.set(K_BOOK, n); }, []);
+  /* Back-checked statements go into the book only when "Save to audit" is pressed. */
+  const saveBackCheck = (book, records) => {
+    saveBook(book);
+    saveAudit([{ id: uid(), at: new Date().toISOString(), kind: "statement-audit", files: records.map((r) => r.file), banks: [...new Set(records.map((r) => r.bank))] }, ...auditLog].slice(0, 300));
+  };
+  /* Figures typed from a paper statement are marked "entered" and logged. */
+  const enterFigures = (id, { opening, closing }) => {
+    const st = stmtBook.find((s) => s.id === id); if (!st) return;
+    const next = { ...st,
+      ...(opening != null ? { opening, openingSrc: "entered" } : {}),
+      ...(closing != null ? { closing, closingSrc: "entered" } : {}) };
+    saveBook(stmtBook.map((s) => (s.id === id ? next : s)));
+    saveAudit([{ id: uid(), at: new Date().toISOString(), kind: "figures-entered", bank: st.bank, file: st.file,
+      from: { opening: st.opening, closing: st.closing }, to: { opening: next.opening, closing: next.closing } }, ...auditLog].slice(0, 300));
+  };
 
   /* ---- derived ---- */
   const catById = useMemo(() => { const m = {}; categories.forEach((c) => (m[c.id] = c)); return m; }, [categories]);
@@ -606,6 +634,8 @@ export default function ExpenseLedger() {
         "ledger:goals": goals,
         "ledger:balances": balances,
         "ledger:creditMap": creditMap,
+        "ledger:statements": stmtBook,
+        "ledger:auditNotes": auditNotes,
         "ledger:catVersion": CAT_VERSION,
       };
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
@@ -659,7 +689,8 @@ export default function ExpenseLedger() {
     } catch { alert(text); }
   };
 
-  const onImport = (newExpenses, newMap, bankSource, audit, newCredits = [], summary = null) => {
+  const onImport = (newExpenses, newMap, bankSource, audit, newCredits = [], summary = null, stmtRecord = null) => {
+    if (stmtRecord) saveBook(upsertStatement(stmtBook, stmtRecord));
     if (summary && bankSource && (summary.balance != null || summary.amountDue != null)) setBalance(bankSource, { ...summary, src: "statement", at: new Date().toISOString() });
     if (newExpenses.length) saveExps([...newExpenses, ...expenses]);
     if (newCredits.length) saveCredits([...newCredits, ...credits]);
@@ -878,7 +909,11 @@ export default function ExpenseLedger() {
         <SuspenseView rows={suspenseRows} categories={categories} sym={sym} onClear={clearSuspense}
                       onDelete={(id) => saveExps(expenses.filter((e) => e.id !== id))} />
       ) : view === "audit" ? (
-        <AuditView log={auditLog} sym={sym} />
+        <>
+          <StatementAudit book={stmtBook} expenses={expenses} credits={credits} banks={STMT_BANKS} sym={sym} notes={auditNotes}
+            api={api} onSaveBook={saveBackCheck} onEnterFigures={enterFigures} />
+          <AuditView log={auditLog} sym={sym} />
+        </>
       ) : view === "history" ? (
         <HistoryView sym={sym} />
       ) : view === "income" ? (
@@ -1924,6 +1959,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
   const [credDup, setCredDup] = useState({});
   const [credCats, setCredCats] = useState({});
   const [stmtSummary, setStmtSummary] = useState(null);
+  const [lastExtract, setLastExtract] = useState(null);   // kept for the statement audit
   const existingCreditKeys = useMemo(() => new Set(existingCredits.map(creditDupKey)), [existingCredits]);
   const stageCredits = (list, bank) => {
     const k = {}, inc = {}, dp = {}, cc = {};
@@ -2037,6 +2073,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
                                yearHint: new Date().getFullYear() }),
       });
       setDiag(ex.diagnostics || null);
+      setLastExtract(ex);
 
       const debits = (ex.transactions || []).filter((t) => t.kind !== "credit");
       const creds = (ex.transactions || []).filter((t) => t.kind === "credit");
@@ -2220,7 +2257,24 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
       categoriser: catSummary || null,
     };
 
-    onImport(expenses, newMap, bankSource, audit, newCredits, stmtSummary);
+    // The statement goes into the audit book with every line, including the
+    // ones left unticked here — each with the reason, so the audit can tell a
+    // deliberate skip from a line that went missing.
+    let stmtRecord = null;
+    if (lastExtract && (lastExtract.transactions || []).length && lastExtract.diagnostics?.source !== "claude") {
+      const skipped = [
+        ...txns.filter((t) => !include[t.key]).map((t) => ({ date: t.date, amount: t.amount, kind: "debit", desc: t.desc, reason: dup[t.key] ? "already in the ledger" : "unticked at import" })),
+        ...credTx.filter((t) => !credInclude[t.key]).map((t) => ({ date: t.date, amount: t.amount, kind: "credit", desc: t.desc, reason: credDup[t.key] ? "already in the ledger" : "unticked at import" })),
+      ];
+      const b = BANKS.find((x) => x.key === bankSource);
+      stmtRecord = makeStatementRecord({
+        id: uid(), bank: bankSource, mode: b?.mode, file: fileName, via: "import",
+        transactions: lastExtract.transactions, figures: { ...(lastExtract.figures || {}), amountDue: lastExtract.summary?.amountDue },
+        diagnostics: lastExtract.diagnostics, skipped,
+      });
+      audit.statement = { from: stmtRecord.from, to: stmtRecord.to, opening: stmtRecord.opening, closing: stmtRecord.closing };
+    }
+    onImport(expenses, newMap, bankSource, audit, newCredits, stmtSummary, stmtRecord);
   };
 
   return (
@@ -2893,7 +2947,7 @@ function Styles() {
 .person-row{display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:4px;}
 .person-btn{border:1px solid var(--border);border-radius:12px;padding:2px 8px;font-size:11px;cursor:pointer;background:transparent;color:var(--ink);line-height:1.6;}
 .person-btn.on{background:var(--teal);color:#fff;border-color:var(--teal);}
-` + dashCss + incomeCss + featuresCss + `
+` + dashCss + incomeCss + featuresCss + auditCss + `
 .cat-edit-wrap{border-bottom:1px solid var(--hairline); padding-bottom:6px; margin-bottom:6px;}
 .due-io{background:var(--surface); border:1px solid var(--hairline); border-radius:12px; padding:12px 14px; margin-bottom:14px; font-size:13px;}
 .due-io-head{display:flex; flex-direction:column; gap:2px; margin-bottom:10px;}

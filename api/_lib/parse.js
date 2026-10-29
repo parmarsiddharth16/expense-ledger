@@ -20,6 +20,8 @@
  * the whole statement, never per row, or a swapped column would validate itself.
  */
 
+import { BALANCE_LINE_RE } from "./figures.js";
+
 const MONTHS = { jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,sept:9,oct:10,nov:11,dec:12 };
 
 const DATE_RE = /^(\d{1,2})[/\-. ](\d{1,2}|[A-Za-z]{3,4})[/\-. ](\d{4}|\d{2})(?![\d/\-.]\d|\d)/;
@@ -151,7 +153,7 @@ function headerRoles(lines) {
  * sparse ones (a credit column in a month with one refund) only where they sit
  * to the right of the anchors — i.e. in the money area, not in the narration.
  */
-function clusterColumns(allTokens, rowCount, tol = 14) {
+function clusterColumns(allTokens, rowCount, tol = 14, headerLeft = null) {
   const xs = allTokens.map((t) => t.right).sort((a, b) => a - b);
   if (!xs.length) return [];
   const groups = [];
@@ -168,7 +170,11 @@ function clusterColumns(allTokens, rowCount, tol = 14) {
 
   const strong = all.filter((c) => c.count >= Math.max(2, rowCount * 0.6));
   if (!strong.length) return all.filter((c) => c.count >= Math.max(2, rowCount * 0.4));
-  const leftBound = Math.min(...strong.map((c) => c.min)) - 6;
+  // A short statement can have only the balance column on "most" rows (Union
+  // Bank: six rows, three in, three out). When the header names the money
+  // columns, the money area starts at its leftmost money word, not at the anchor.
+  let leftBound = Math.min(...strong.map((c) => c.min)) - 6;
+  if (headerLeft != null && headerLeft < leftBound) leftBound = headerLeft - 6;
   return all.filter((c) => c.min >= leftBound && (strong.includes(c) || c.count >= 1));
 }
 
@@ -208,8 +214,10 @@ export function parseStatement(lines, opts = {}) {
   }
 
   // pass 2 — discover the money columns, then name them
-  const cols = clusterColumns(dated.flatMap((r) => r.toks), dated.length);
   const header = headerRoles(lines);
+  const strongHeader = header && header.roles.some((r) => r.role === "balance") && header.roles.length >= 2;
+  const cols = clusterColumns(dated.flatMap((r) => r.toks), dated.length, 14,
+    strongHeader ? Math.min(...header.roles.map((r) => r.x)) : null);
   const hRoles = header ? header.roles.filter((r) => r.role !== "amount" || header.roles.length === 1) : [];
 
   let names;
@@ -333,7 +341,9 @@ export function parseStatement(lines, opts = {}) {
     if (r.debit && r.amountCr) { r.credit = r.debit; r.debit = 0; }
     delete r.above; delete r.below; delete r.amount; delete r.amountCr; delete r.y;
   }
-  const kept = rows.filter((r) => r.debit || r.credit);
+  // "Opening balance" / "Balance b/f" rows inside the table aren't money moving —
+  // on a one-column card statement they would otherwise read as a purchase.
+  const kept = rows.filter((r) => (r.debit || r.credit) && !BALANCE_LINE_RE.test(r.description));
   rows.length = 0; rows.push(...kept);
 
   return {

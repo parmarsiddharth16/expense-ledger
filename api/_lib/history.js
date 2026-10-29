@@ -31,6 +31,8 @@ const KEY_LABELS = {
   "ledger:creditMap": "money-in memory",
   "ledger:goals": "savings goals",
   "ledger:balances": "balances",
+  "ledger:statements": "statement audit",
+  "ledger:auditNotes": "audit notes",
 };
 
 export function emptyHistory() {
