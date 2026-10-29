@@ -68,15 +68,19 @@ const FIELDS = [
   // "Total" is required: a bare "Debits / Credits" is usually the table header
   ["debits",    /total\s+debit\s+amount|total\s+debits?|total\s+withdrawals?/i],
   ["credits",   /total\s+credit\s+amount|total\s+credits?|total\s+deposits?/i],
+  // bare "Debits" / "Credits": only trusted in a summary box (positional mode)
+  ["debits",    /\bdebits\b/i, "weak"],
+  ["credits",   /\bcredits\b/i, "weak"],
 ];
 const COUNT_FIELDS = new Set(["drCount", "crCount"]);
 
 /** Every field label on a line, left to right, without overlaps. */
-function labelsIn(text) {
+function labelsIn(text, { weak = false } = {}) {
   const hits = [];
-  for (const [name, re] of FIELDS) {
+  for (const [name, re, kind] of FIELDS) {
+    if (kind === "weak" && !weak) continue;
     const g = new RegExp(re.source, "gi");
-    for (const m of text.matchAll(g)) hits.push({ name, at: m.index, end: m.index + m[0].length });
+    for (const m of text.matchAll(g)) hits.push({ name, at: m.index, end: m.index + m[0].length, weak: kind === "weak" });
   }
   hits.sort((a, b) => a.at - b.at || (b.end - b.at) - (a.end - a.at));
   const out = [];
@@ -97,14 +101,46 @@ const signed = (n, mode) => {
  * @returns {{opening?, closing?, debits?, credits?, payments?, purchases?, charges?,
  *            drCount?, crCount?, from?, to?, found: Record<string,string>}}
  */
-export function readFigures(lineTexts = [], { mode = "savings" } = {}) {
-  const L = lineTexts.map((t) => String(t || "").replace(/\s+/g, " ").trim());
+export function readFigures(lineInput = [], { mode = "savings" } = {}) {
+  const L = lineInput.map((t) => String((t && typeof t === "object" ? t.text : t) || "").replace(/\s+/g, " ").trim());
   const out = { found: {} };
   const put = (name, value, how) => {
     if (value == null || !isFinite(value) || name in out) return;  // first sighting wins
     out[name] = Math.round(value * 100) / 100;
     out.found[name] = how;
   };
+
+  // (E) HDFC card summary box: "prev dues − payments + purchases + finance
+  // charges = total due". Read first — it is unambiguous, and its header is
+  // split over several lines so the label readers below can't pair it.
+  // The bank rounds Total Amount Due to the rupee; the exact closing (which is
+  // what the next statement opens with) is the sum of the boxes.
+  for (const text of L) {
+    // HDFC prints ₹ as a glyph that extracts as "C", and draws the minus
+    // between the first two boxes as a graphic, so it may be missing
+    const m = stripDates(text).replace(/₹|rs\.?|inr/gi, "").replace(/(^|\s)C(?=\d)/g, "$1")
+      .match(/(-?[\d,]+\.\d{2})(\s*cr)?\s*-?\s*([\d,]+\.\d{2})\s*\+\s*([\d,]+\.\d{2})\s*\+\s*([\d,]+\.\d{2})\s*=\s*(-?[\d,]+\.\d{2})(\s*cr)?/i);
+    if (!m) continue;
+    const n = (x) => parseFloat(x.replace(/,/g, ""));
+    const opening = m[2] ? -n(m[1]) : n(m[1]);
+    const total = m[7] ? -n(m[6]) : n(m[6]);
+    const exact = Math.round((opening - n(m[3]) + n(m[4]) + n(m[5])) * 100) / 100;
+    put("opening", opening, "summary box");
+    put("payments", n(m[3]), "summary box");
+    put("purchases", n(m[4]), "summary box");
+    put("charges", n(m[5]), "summary box");
+    if (Math.abs(exact - total) < 1) { put("closing", exact, "summary box"); out.closingRounded = total; }
+    else put("closing", total, "summary box");
+    break;
+  }
+
+  // (0) Summary boxes read by position, when we have it (PDFs). Some banks
+  // stack their labels on two rows (SBI: "Brought Forward … Closing Balance"
+  // above "Dr Count … Total Credits"), so reading in order mixes them up;
+  // a value belongs to the label printed above it.
+  if (lineInput.some((l) => l && typeof l === "object" && Array.isArray(l.items))) {
+    positional(lineInput, mode, put);
+  }
 
   for (let i = 0; i < L.length; i++) {
     const text = L[i];
@@ -150,23 +186,6 @@ export function readFigures(lineTexts = [], { mode = "savings" } = {}) {
     }
   }
 
-  // HDFC card summary box, when its header is split over two lines: the values
-  // row is always "prev dues − payments + purchases + finance charges = total".
-  if (!("opening" in out) || !("closing" in out)) {
-    for (const text of L) {
-      const m = stripDates(text).replace(/₹|rs\.?|inr/gi, "")
-        .match(/(-?[\d,]+\.\d{2})(\s*cr)?\s*-\s*([\d,]+\.\d{2})\s*\+\s*([\d,]+\.\d{2})\s*\+\s*([\d,]+\.\d{2})\s*=\s*(-?[\d,]+\.\d{2})(\s*cr)?/i);
-      if (!m) continue;
-      const n = (s) => parseFloat(s.replace(/,/g, ""));
-      put("opening", m[2] ? -n(m[1]) : n(m[1]), "summary equation");
-      put("payments", n(m[3]), "summary equation");
-      put("purchases", n(m[4]), "summary equation");
-      put("charges", n(m[5]), "summary equation");
-      put("closing", m[7] ? -n(m[6]) : n(m[6]), "summary equation");
-      break;
-    }
-  }
-
   // Statement period: the first line that names one, with two dates on it.
   for (const text of L) {
     if (!/period|from|statement\s+(?:for|of)|\bto\b|\s-\s/i.test(text)) continue;
@@ -177,6 +196,67 @@ export function readFigures(lineTexts = [], { mode = "savings" } = {}) {
     }
   }
   return out;
+}
+
+/* Text of a PDF line rebuilt from its items, with each item's character span,
+ * so a label found in the text can be located on the page. */
+function spans(line) {
+  let text = "", prevEnd = null;
+  const items = [];
+  for (const it of line.items || []) {
+    if (prevEnd !== null && it.x - prevEnd > 1.2) text += " ";
+    items.push({ at: text.length, end: text.length + it.str.length, x0: it.x, x1: it.x + it.w, str: it.str });
+    text += it.str;
+    prevEnd = it.x + it.w;
+  }
+  return { text, items };
+}
+const xRange = (sp, at, end) => {
+  const hit = sp.items.filter((it) => it.end > at && it.at < end);
+  if (!hit.length) return null;
+  // a label sharing an item with others: interpolate within the item
+  const first = hit[0], last = hit[hit.length - 1];
+  const fx = (it, c) => it.x0 + ((c - it.at) / Math.max(1, it.end - it.at)) * (it.x1 - it.x0);
+  return { x0: fx(first, Math.max(at, first.at)), x1: fx(last, Math.min(end, last.end)) };
+};
+
+function positional(lines, mode, put) {
+  for (let i = 0; i < lines.length; i++) {
+    // a block of label rows…
+    const labelRows = [];
+    let j = i;
+    while (j < lines.length && labelRows.length < 3) {
+      const sp = spans(lines[j]);
+      const labs = labelsIn(sp.text, { weak: true });
+      if (!labs.length || numbersIn(sp.text).some((n) => n.money)) break;
+      labelRows.push(...labs.map((l) => ({ ...l, ...xRange(sp, l.at, l.end) })).filter((l) => l.x0 != null));
+      j++;
+    }
+    const strong = labelRows.filter((l) => !l.weak);
+    if (labelRows.length < 2 || !strong.length || !labelRows.some((l) => /opening|closing|Count/.test(l.name))) continue;
+    // …then the value rows under it (no dates: a dated row is a transaction)
+    const vals = [];
+    for (let k = j; k < Math.min(j + 3, lines.length); k++) {
+      const sp = spans(lines[k]);
+      if (labelsIn(sp.text).length || datesIn(sp.text).length) break;
+      for (const n of numbersIn(sp.text)) { const r = xRange(sp, n.at, n.end); if (r) vals.push({ ...n, ...r }); }
+    }
+    if (vals.length < 2) continue;
+    const used = new Set();
+    for (const v of vals) {
+      const cx = (v.x0 + v.x1) / 2;
+      let best = null, bd = Infinity;
+      for (const l of labelRows) {
+        if (used.has(l)) continue;
+        if (COUNT_FIELDS.has(l.name) ? v.money : !v.money) continue;
+        const overlap = Math.min(v.x1, l.x1) - Math.max(v.x0, l.x0);
+        const d = overlap > 0 ? -overlap : Math.min(Math.abs(cx - l.x0), Math.abs(cx - l.x1));
+        if (d < bd) { bd = d; best = l; }
+      }
+      if (best && bd < 60) { used.add(best); put(best.name, signed(v, mode), "summary box"); }
+    }
+    i = j;
+  }
 }
 
 /**

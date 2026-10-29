@@ -53,10 +53,10 @@ const MODE = { hdfc_regalia: "card", hdfc_solitaire: "card" };
 
 /* What the bank says the statement adds up to, plus what the running balance
  * says — the audit compares both against the transactions we read. */
-function statementFigures(lineTexts, rows, balanceCheck, bank) {
+function statementFigures(lineInput, rows, balanceCheck, bank) {
   const mode = MODE[bank] || "savings";
   let printed = {};
-  try { printed = readFigures(lineTexts, { mode }); } catch { printed = { found: {} }; }
+  try { printed = readFigures(lineInput, { mode }); } catch { printed = { found: {} }; }
   const derived = balanceCheck ? balancesFromRows(rows, balanceCheck.direction) : {};
   return { mode, printed, derived };
 }
@@ -190,7 +190,7 @@ export default async function handler(req, res) {
         aiError,
       },
       summary: (() => { try { return summarizeStatement(lines.map((l) => l.text)); } catch { return {}; } })(),
-      figures: statementFigures(lines.map((l) => l.text), source === "claude" ? [] : parsed.transactions, source === "claude" ? null : parsed.balanceCheck, body.bank),
+      figures: statementFigures(lines, source === "claude" ? [] : parsed.transactions, source === "claude" ? null : parsed.balanceCheck, body.bank),
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String((e && e.message) || e) });

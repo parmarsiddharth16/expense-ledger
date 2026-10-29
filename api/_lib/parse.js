@@ -337,6 +337,9 @@ export function parseStatement(lines, opts = {}) {
     if (r.amount !== null && !r.debit && !r.credit) {
       if (r.amountCr || CREDIT_HINT.test(r.description)) r.credit = r.amount; else r.debit = r.amount;
     }
+    // HDFC cards mark money in with a plus before the rupee sign: "+ ₹ 82,249.00"
+    // (₹ extracts as "C"). A plus before a bare number is reward points.
+    if (r.debit && !r.credit && /\+\s*[C₹]\s*[\d,]+\.\d{2}\s*(?:l\s*)?$/.test(r.raw)) { r.credit = r.debit; r.debit = 0; }
     // an explicit Cr marker always wins over column placement
     if (r.debit && r.amountCr) { r.credit = r.debit; r.debit = 0; }
     delete r.above; delete r.below; delete r.amount; delete r.amountCr; delete r.y;
