@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
   ChevronLeft, ChevronRight, Plus, Trash2, SlidersHorizontal, X,
   TriangleAlert, Check, Wallet, ArrowUpRight, Sparkles, Eye, EyeOff,
@@ -1205,6 +1205,15 @@ function AnalysisView({ grouped, sym, selMonth, expenses = [], categories = [], 
   }, [spendExp, spendCats]);
   const PERSON_COLORS = { Sid: "var(--teal)", Manali: "#c084fc", Saryu: "var(--amber)", Untagged: "var(--hairline)" };
 
+  /* category picked for the trend card; the table below sets it on tap */
+  const [trendCat, setTrendCat] = useState(() => { try { return localStorage.getItem("ledger:trendCat") || ""; } catch { return ""; } });
+  const pickTrend = (id) => {
+    setTrendCat(id);
+    try { localStorage.setItem("ledger:trendCat", id); } catch { /* private mode */ }
+    const el = document.getElementById("cat-trend");
+    if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
   return (
     <div className="analysis-wrap">
       <div className="panel-head" style={{ marginBottom: 10 }}>
@@ -1212,6 +1221,11 @@ function AnalysisView({ grouped, sym, selMonth, expenses = [], categories = [], 
           Analysis · {label(selMonth)}
         </h2>
       </div>
+
+      <CategoryTrend expenses={expenses} categories={categories} catById={catById} selMonth={selMonth} sym={sym}
+        catId={trendCat} onPick={pickTrend} />
+      <CategoryMoM expenses={expenses} categories={categories} catById={catById} selMonth={selMonth} sym={sym}
+        picked={trendCat} onPick={pickTrend} />
 
       {/* Month-over-month trend (whole FY) */}
       <div className="panel analysis-panel">
@@ -1297,7 +1311,6 @@ function AnalysisView({ grouped, sym, selMonth, expenses = [], categories = [], 
         <div className="imp-note" style={{ marginTop: 6 }}><Info size={13} /> Entries tagged to more than one person are split equally.</div>
       </div>
 
-      <CategoryMoM expenses={expenses} categories={categories} catById={catById} selMonth={selMonth} sym={sym} />
       {grouped.filter((g) => !g.nonSpend).map((g) => {
         const data = g.rows.map((r) => ({
           name: r.name.length > 18 ? r.name.slice(0, 17) + "…" : r.name,
@@ -1338,10 +1351,158 @@ function AnalysisView({ grouped, sym, selMonth, expenses = [], categories = [], 
   );
 }
 
+/* A month-on-month move worth flagging: up or down by 30%+ AND by at least
+ * ₹2,000, so small categories swinging ₹300 → ₹500 don't light up. */
+const JUMP_PCT = 30, JUMP_MIN = 2000;
+function momChange(prev, cur) {
+  if (prev === null || prev === undefined) return null;
+  const d = cur - prev;
+  if (!prev && !cur) return null;
+  if (!prev) return { d, pct: null, kind: "new", big: cur >= JUMP_MIN ? "up" : "" };
+  const pct = Math.round((d / prev) * 100);
+  const big = Math.abs(d) >= JUMP_MIN && Math.abs(pct) >= JUMP_PCT ? (d > 0 ? "up" : "down") : "";
+  return { d, pct, kind: "pct", big };
+}
+
+/* One category, every month side by side: spend, budget, and the change from
+ * the month before in ₹ and %. Pick the category from the list, or tap a row
+ * in the table below. */
+function CategoryTrend({ expenses, categories, catById, selMonth, sym, catId, onPick }) {
+  const cur = currentPeriod();
+  const keys = useMemo(() => {
+    const last = cur < FY_END ? (cur > FY_START ? cur : FY_START) : FY_END;
+    const a = []; for (let k = FY_START; k <= last; k = shiftMonth(k, 1)) a.push(k); return a;
+  }, [cur]);
+  const fmt = (n) => `${n < 0 ? "−" : ""}${sym}${new Intl.NumberFormat("en-IN").format(Math.abs(Math.round(n || 0)))}`;
+  const fmtShort = (n) => { const a = Math.abs(Math.round(n || 0)); return a >= 100000 ? `${(a / 100000).toFixed(1)}L` : a >= 10000 ? `${Math.round(a / 1000)}k` : a >= 1000 ? `${(a / 1000).toFixed(1).replace(/\.0$/, "")}k` : String(a); };
+  const stripRef = useRef(null);
+
+  /* spend per category per month, for the picker's order and the default */
+  const spentBy = useMemo(() => {
+    const m = {}; const ks = new Set(keys);
+    expenses.forEach((e) => {
+      const k = periodOf(e.date); if (!ks.has(k)) return;
+      const id = catById[e.cat] ? e.cat : "__uncat__";
+      (m[id] = m[id] || {})[k] = (m[id][k] || 0) + e.amount;
+    });
+    return m;
+  }, [expenses, catById, keys]);
+
+  const options = useMemo(() => {
+    const groups = SECTIONS.map((sec) => ({ sec, cats: categories.filter((c) => c.section === sec) })).filter((g) => g.cats.length);
+    if (spentBy.__uncat__) groups.push({ sec: "Other", cats: [{ id: "__uncat__", name: "Uncategorised spend" }] });
+    return groups;
+  }, [categories, spentBy]);
+
+  /* default: this month's biggest jump on the month before, else its biggest spend */
+  const fallback = useMemo(() => {
+    const prevK = shiftMonth(selMonth, -1);
+    let jump = "", jd = 0, best = "", max = -1;
+    categories.forEach((c) => {
+      if (c.section === NONSPEND_SECTION) return;
+      const v = spentBy[c.id]?.[selMonth] || 0, pv = spentBy[c.id]?.[prevK] || 0;
+      const ch = momChange(pv, v);
+      if (ch?.big === "up" && ch.d > jd) { jd = ch.d; jump = c.id; }
+      if (v > max) { max = v; best = c.id; }
+    });
+    return jump || best;
+  }, [categories, spentBy, selMonth]);
+  const valid = catId && (catId === "__uncat__" ? !!spentBy.__uncat__ : !!catById[catId]);
+  const id = valid ? catId : fallback;
+  const cat = id === "__uncat__" ? { id, name: "Uncategorised spend" } : catById[id];
+  const nonSpend = cat?.section === NONSPEND_SECTION;
+
+  const rows = useMemo(() => keys.map((k, i) => {
+    const s = spentBy[id]?.[k] || 0;
+    const b = !cat || id === "__uncat__" || nonSpend ? 0 : budgetFor(cat, k);
+    const prev = i > 0 ? spentBy[id]?.[keys[i - 1]] || 0 : null;
+    return { k, name: monthLabel(k, { month: "short" }), s: Math.round(s), b: Math.round(b), c: momChange(prev, s) };
+  }), [keys, spentBy, id, cat, nonSpend]);
+
+  /* open the month strip at the selected month (phones show only 2–3 tiles) */
+  useEffect(() => {
+    const box = stripRef.current; if (!box) return;
+    const el = box.querySelector(".trend-m.is-sel") || box.lastElementChild;
+    if (el) box.scrollLeft = Math.max(0, el.offsetLeft - box.offsetLeft - box.clientWidth + el.offsetWidth + 8);
+  }, [id, selMonth, rows.length]);
+
+  if (!cat) return null;
+  const done = rows.filter((r) => r.k < cur && r.s > 0);
+  const total = rows.reduce((a, r) => a + r.s, 0);
+  const avg = done.length ? done.reduce((a, r) => a + r.s, 0) / done.length : 0;
+  const peak = rows.reduce((m, r) => (r.s > (m?.s || 0) ? r : m), null);
+  const jumps = rows.filter((r) => r.c?.big === "up").length;
+  const sel = rows.find((r) => r.k === selMonth);
+
+  return (
+    <div className="panel analysis-panel" id="cat-trend">
+      <div className="analysis-sec-head mom-head">
+        <span className="sec-name">Category month by month</span>
+        <label className="trend-pick">
+          <span className="sr-only">Category</span>
+          <select value={id} onChange={(e) => onPick(e.target.value)} aria-label="Category">
+            {options.map((g) => (
+              <optgroup key={g.sec} label={g.sec}>
+                {g.cats.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </optgroup>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      <div className="trend-stats">
+        <div><span>FY so far</span><strong className="num">{fmt(total)}</strong></div>
+        <div><span>Avg / month</span><strong className="num">{fmt(avg)}</strong><em>closed months with spend</em></div>
+        <div><span>Highest</span><strong className="num">{peak && peak.s ? fmt(peak.s) : "—"}</strong><em>{peak && peak.s ? monthLabel(peak.k, { month: "long" }) : ""}</em></div>
+        <div><span>{monthLabel(selMonth, { month: "short" })} vs avg</span>
+          <strong className={`num ${sel && avg && sel.s > avg * 1.3 ? "t-red" : sel && avg && sel.s < avg * 0.7 ? "t-teal" : ""}`}>
+            {sel && avg ? (() => { const v = Math.round(((sel.s - avg) / avg) * 100); return `${v > 0 ? "+" : v < 0 ? "−" : ""}${Math.abs(v)}%`; })() : "—"}
+          </strong><em>{jumps ? `${jumps} big jump${jumps === 1 ? "" : "s"} this FY` : "no big jumps this FY"}</em></div>
+      </div>
+
+      <ResponsiveContainer width="100%" height={190}>
+        <ComposedChart data={rows} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+          <XAxis dataKey="name" tick={{ fontSize: 11, fill: "var(--muted)", fontFamily: "Inter,sans-serif" }} axisLine={false} tickLine={false} />
+          <YAxis tick={{ fontSize: 11, fill: "var(--faint)", fontFamily: "Inter,sans-serif" }} axisLine={false} tickLine={false} width={40} tickFormatter={fmtShort} />
+          <Tooltip contentStyle={{ borderRadius: 10, border: "1px solid var(--hairline)", fontSize: 12, fontFamily: "Inter,sans-serif" }}
+            formatter={(v, n) => [fmt(v), n === "s" ? "Spent" : "Budget"]} />
+          <Bar dataKey="s" name="s" radius={[4, 4, 0, 0]} maxBarSize={28}>
+            {rows.map((r) => <Cell key={r.k} fill={r.c?.big === "up" ? "var(--red)" : r.k === selMonth ? "var(--ink)" : "var(--teal)"} />)}
+          </Bar>
+          {!nonSpend && id !== "__uncat__" && <Line dataKey="b" name="b" type="stepAfter" stroke="var(--muted)" strokeWidth={1.5} strokeDasharray="4 4" dot={false} />}
+        </ComposedChart>
+      </ResponsiveContainer>
+
+      <div className="trend-months" role="list" ref={stripRef}>
+        {rows.map((r) => {
+          const c = r.c;
+          const dir = !c || !c.d ? "flat" : c.d > 0 ? "up" : "down";
+          return (
+            <div role="listitem" key={r.k} className={`trend-m${r.k === selMonth ? " is-sel" : ""}${c?.big ? " big-" + c.big : ""}`}>
+              <span className="tm-name">{monthLabel(r.k, { month: "short", year: "2-digit" })}{r.k === cur ? " · so far" : ""}</span>
+              <span className="tm-amt num">{fmt(r.s)}</span>
+              {r.b > 0 && <span className={`tm-bud num${r.s > r.b ? " over" : ""}`}>of {fmt(r.b)}</span>}
+              <span className={`tm-chg num ${dir}`}>
+                {!c ? "first month" : c.kind === "new" ? `new · +${fmt(c.d)}` : `${c.d > 0 ? "▲" : c.d < 0 ? "▼" : ""} ${fmt(Math.abs(c.d))} · ${Math.abs(c.pct)}%`}
+              </span>
+              {c?.big === "up" && <span className="tm-flag">Big jump</span>}
+              {c?.big === "down" && <span className="tm-flag down">Big drop</span>}
+            </div>
+          );
+        })}
+      </div>
+      <div className="imp-note" style={{ marginTop: 8 }}>
+        <Info size={13} /> Change is against the month before. “Big jump” means up {JUMP_PCT}%+ and at least {sym}{new Intl.NumberFormat("en-IN").format(JUMP_MIN)}.
+        {nonSpend ? " This category is recorded only and isn't counted in spend." : ""}
+      </div>
+    </div>
+  );
+}
+
 /* Month-on-month spend per category across the FY. One row per category,
  * one column per month; switch between spent, budget and variance. */
-function CategoryMoM({ expenses, categories, catById, selMonth, sym }) {
-  const [metric, setMetric] = useState("spent"); // spent | budget | variance
+function CategoryMoM({ expenses, categories, catById, selMonth, sym, picked = "", onPick = () => {} }) {
+  const [metric, setMetric] = useState("spent"); // spent | change | budget | variance
   const [hideZero, setHideZero] = useState(true);
   const keys = useMemo(() => { const a = []; for (let k = FY_START; k <= FY_END; k = shiftMonth(k, 1)) a.push(k); return a; }, []);
   const short = (n) => {
@@ -1394,6 +1555,11 @@ function CategoryMoM({ expenses, categories, catById, selMonth, sym }) {
   }, [expenses, categories, catById, keys]);
 
   const val = (x) => metric === "spent" ? x.s : metric === "budget" ? x.b : x.v;
+  /* "vs last month" cells: % change from the month before, big moves coloured */
+  const nowK = currentPeriod();
+  const chg = (cells, i) => cells[i].k > nowK ? null : momChange(i > 0 ? cells[i - 1].s : null, cells[i].s);
+  const chgText = (c) => !c ? "–" : c.kind === "new" ? "new" : `${c.pct > 0 ? "+" : c.pct < 0 ? "−" : ""}${Math.abs(c.pct)}%`;
+  const chgTone = (c) => !c ? "" : c.big === "up" ? "mom-over" : c.big === "down" ? "mom-under" : "";
   const tone = (x, nonSpend) => {
     if (nonSpend || metric === "budget") return "";
     if (metric === "variance") return x.v > 0 ? "mom-over" : x.v < 0 ? "mom-under" : "";
@@ -1403,7 +1569,7 @@ function CategoryMoM({ expenses, categories, catById, selMonth, sym }) {
     return "";
   };
   const visible = (r) => !hideZero || r.s > 0 || (metric === "budget" && r.b > 0);
-  const METRICS = [["spent", "Spent"], ["budget", "Budget"], ["variance", "Over / under"]];
+  const METRICS = [["spent", "Spent"], ["change", "vs last month"], ["budget", "Budget"], ["variance", "Over / under"]];
 
   return (
     <div className="panel analysis-panel">
@@ -1438,16 +1604,21 @@ function CategoryMoM({ expenses, categories, catById, selMonth, sym }) {
                 <React.Fragment key={g.section}>
                   <tr className="mom-sec"><td colSpan={keys.length + 3}>{g.section}{g.nonSpend ? " · not counted in spend" : ""}</td></tr>
                   {rows.map((r) => (
-                    <tr key={r.id} className={r.nonSpend ? "mom-ns" : ""}>
+                    <tr key={r.id} className={`mom-row${r.nonSpend ? " mom-ns" : ""}${picked === r.id ? " mom-picked" : ""}`}
+                        onClick={() => onPick(r.id)} tabIndex={0} role="button" aria-label={`Show ${r.name} month by month`}
+                        onKeyDown={(ev) => (ev.key === "Enter" || ev.key === " ") && (ev.preventDefault(), onPick(r.id))}>
                       <td className="mom-cat" title={r.name}>{r.name}</td>
-                      {r.cells.map((x) => (
-                        <td key={x.k} className={`${tone(x, r.nonSpend)}${x.k === selMonth ? " mom-sel" : ""}`}
+                      {r.cells.map((x, i) => {
+                        const c = metric === "change" ? chg(r.cells, i) : null;
+                        return (
+                        <td key={x.k} className={`${metric === "change" ? chgTone(c) : tone(x, r.nonSpend)}${x.k === selMonth ? " mom-sel" : ""}`}
                             title={`${r.name} · ${monthLabel(x.k, { month: "short", year: "numeric" })}\nSpent ${full(x.s)}${r.nonSpend ? "" : ` · Budget ${full(x.b)}`}`}>
-                          {short(val(x))}
+                          {metric === "change" ? chgText(c) : short(val(x))}
                         </td>
-                      ))}
-                      <td className={`mom-tot ${tone(r, r.nonSpend)}`}>{short(val(r))}</td>
-                      <td className="mom-tot">{metric === "spent" ? short(r.avg) : ""}</td>
+                        );
+                      })}
+                      <td className={`mom-tot ${metric === "change" ? "" : tone(r, r.nonSpend)}`}>{short(metric === "change" ? r.s : val(r))}</td>
+                      <td className="mom-tot">{metric === "spent" || metric === "change" ? short(r.avg) : ""}</td>
                     </tr>
                   ))}
                 </React.Fragment>
@@ -1457,15 +1628,21 @@ function CategoryMoM({ expenses, categories, catById, selMonth, sym }) {
           <tfoot>
             <tr>
               <td className="mom-cat">Total spend</td>
-              {totals.cells.map((x) => <td key={x.k} className={`${tone(x, false)}${x.k === selMonth ? " mom-sel" : ""}`} title={`Spent ${full(x.s)} · Budget ${full(x.b)}`}>{short(val(x))}</td>)}
-              <td className={`mom-tot ${tone(totals, false)}`}>{short(val(totals))}</td>
-              <td className="mom-tot">{metric === "spent" ? short(totals.avg) : ""}</td>
+              {totals.cells.map((x, i) => {
+                const c = metric === "change" ? chg(totals.cells, i) : null;
+                return <td key={x.k} className={`${metric === "change" ? chgTone(c) : tone(x, false)}${x.k === selMonth ? " mom-sel" : ""}`} title={`Spent ${full(x.s)} · Budget ${full(x.b)}`}>{metric === "change" ? chgText(c) : short(val(x))}</td>;
+              })}
+              <td className={`mom-tot ${metric === "change" ? "" : tone(totals, false)}`}>{short(metric === "change" ? totals.s : val(totals))}</td>
+              <td className="mom-tot">{metric === "spent" || metric === "change" ? short(totals.avg) : ""}</td>
             </tr>
           </tfoot>
         </table>
       </div>
       <div className="imp-note" style={{ marginTop: 8 }}>
-        <Info size={13} /> Red = over that month's budget, amber = 80%+ used. Hover a cell for exact figures. Totals exclude Claims &amp; Transfers.
+        <Info size={13} /> {metric === "change"
+          ? <>Red = up 30%+ and {sym}2,000+ on the month before, green = down by as much. </>
+          : <>Red = over that month's budget, amber = 80%+ used. </>}
+        Tap a category to see it month by month above. Totals exclude Claims &amp; Transfers.
       </div>
     </div>
   );
@@ -2490,6 +2667,30 @@ function Styles() {
 .mom-table td.mom-over{color:var(--red); font-weight:600;}
 .mom-table td.mom-warn{color:var(--amber); font-weight:600;}
 .mom-table td.mom-under{color:var(--teal);}
+.mom-table tr.mom-row{cursor:pointer;}
+.mom-table tr.mom-row:hover td{background:var(--bg);}
+.mom-table tr.mom-picked td{background:var(--teal-soft);}
+.mom-table tr.mom-row:focus-visible{outline:2px solid var(--teal); outline-offset:-2px;}
+.sr-only{position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap;}
+.trend-pick select{font:inherit; font-size:13px; font-weight:600; color:var(--ink); padding:7px 30px 7px 10px; border:1px solid var(--hairline); border-radius:9px; background:var(--bg); min-height:36px; max-width:100%;}
+.trend-stats{display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin:6px 0 10px;}
+.trend-stats > div{display:flex; flex-direction:column; gap:2px; padding:8px 10px; border:1px solid var(--hairline); border-radius:10px; background:var(--bg); min-width:0;}
+.trend-stats span{font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); font-weight:600;}
+.trend-stats strong{font-size:16px; color:var(--ink);}
+.trend-stats strong.t-red{color:var(--red);} .trend-stats strong.t-teal{color:var(--teal);}
+.trend-stats em{font-style:normal; font-size:11px; color:var(--faint);}
+.trend-months{display:flex; gap:8px; overflow-x:auto; padding:4px 2px 6px; margin-top:6px; scroll-snap-type:x proximity;}
+.trend-m{flex:0 0 132px; scroll-snap-align:start; display:flex; flex-direction:column; gap:2px; padding:9px 10px; border:1px solid var(--hairline); border-radius:10px; background:var(--surface);}
+.trend-m.is-sel{border-color:var(--ink); box-shadow:inset 0 0 0 1px var(--ink);}
+.trend-m.big-up{background:var(--red-soft); border-color:#EDB8C2;}
+.trend-m.big-down{background:var(--teal-soft); border-color:#BFE0D8;}
+.tm-name{font-size:11px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.05em;}
+.tm-amt{font-size:15px; font-weight:600; color:var(--ink);}
+.tm-bud{font-size:11px; color:var(--faint);} .tm-bud.over{color:var(--red);}
+.tm-chg{font-size:11.5px; color:var(--muted);} .big-up .tm-chg{color:var(--red); font-weight:600;} .big-down .tm-chg{color:var(--teal); font-weight:600;}
+.tm-flag{align-self:flex-start; margin-top:3px; font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:#fff; background:var(--red); border-radius:5px; padding:2px 6px;}
+.tm-flag.down{background:var(--teal);}
+@media (max-width:640px){ .trend-stats{grid-template-columns:1fr 1fr;} .trend-pick, .trend-pick select{width:100%;} .mom-head .sec-name{width:100%;} }
 .mom-table tfoot td{font-weight:700; border-top:2px solid var(--ink); border-bottom:0;}
 .analysis-panel{padding:14px 18px 6px;}
 .analysis-sec-head{display:flex; justify-content:space-between; align-items:baseline; padding-bottom:8px; margin-bottom:4px; border-bottom:1px solid var(--hairline);}
