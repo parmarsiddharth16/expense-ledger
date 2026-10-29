@@ -242,12 +242,13 @@ const isoOf = (k, d) => `${k}-${String(clampDay(k, d)).padStart(2, "0")}`;
 
 /**
  * Every bill in a month with its due date and where it stands:
- * paid · part · overdue · soon (≤7 days) · upcoming · nodate.
+ * paid · part · overdue · awaiting (date passed, statements not all in) ·
+ * soon (≤7 days) · upcoming · nodate.
  * Card bills come from the due day set per card; the amount is last month's
  * spend on that card, and it counts as paid once a card-payment credit for
  * that card is recorded in the month.
  */
-export function billsForMonth({ categories, expenses, credits = [], cardDue = {}, balances = {}, selMonth }) {
+export function billsForMonth({ categories, expenses, credits = [], cardDue = {}, balances = {}, selMonth, stmtsComplete = true }) {
   const today = new Date();
   const todayIso = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
   const spentBy = {};
@@ -256,7 +257,9 @@ export function billsForMonth({ categories, expenses, credits = [], cardDue = {}
   const status = (paidAmt, due, date) => {
     if (paidAmt >= due * 0.9) return "paid";
     if (!date) return paidAmt > 0 ? "part" : "nodate";
-    if (date < todayIso) return paidAmt > 0 ? "part" : "overdue";
+    // Past its date with nothing recorded: only "overdue" once the month's
+    // statements are all in — until then the payment may simply not be imported.
+    if (date < todayIso) return paidAmt > 0 ? "part" : stmtsComplete ? "overdue" : "awaiting";
     const days = Math.round((Date.parse(date) - Date.parse(todayIso)) / 864e5);
     if (paidAmt > 0) return "part";
     return days <= 7 ? "soon" : "upcoming";
@@ -291,7 +294,7 @@ export function billsForMonth({ categories, expenses, credits = [], cardDue = {}
     const date = dateOnDay(selMonth, day);
     out.push({ id: "card:" + b.key, name: `${b.label} bill`, section: `${monthLabel(prev, { month: "short" })} card spend`, due, paid, date, kind: "card", status: status(paid, due, date) });
   }
-  const rank = { overdue: 0, soon: 1, part: 2, upcoming: 3, nodate: 4, paid: 5 };
+  const rank = { overdue: 0, soon: 1, part: 2, awaiting: 3, upcoming: 4, nodate: 5, paid: 6 };
   return out.sort((a, b) => rank[a.status] - rank[b.status] || (a.date || "9").localeCompare(b.date || "9") || b.due - a.due);
 }
 
@@ -497,6 +500,7 @@ export const incomeCss = `
 .bill-date{display:flex; flex-direction:column; align-items:center; width:46px; flex:none; line-height:1.1; border-radius:10px; padding:5px 0; background:var(--bg);}
 .bill-date strong{font:600 16px 'JetBrains Mono',monospace;}
 .bill-date span{font-size:10.5px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em;}
+.bill-date.awaiting{background:var(--bg);} .bill-date.awaiting strong,.bill-date.awaiting span{color:var(--muted);}
 .bill-date.overdue{background:var(--red-soft);} .bill-date.overdue strong,.bill-date.overdue span{color:var(--red);}
 .bill-date.soon{background:#FBEEDC;} .bill-date.soon strong,.bill-date.soon span{color:var(--amber);}
 .bill-date.paid{opacity:.55;}

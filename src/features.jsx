@@ -345,7 +345,7 @@ export function SplitModal({ entry, categories, sym, onSave, onClose }) {
 /* ------------------------------------------------------------------ */
 /*  Calendar & weekly views                                            */
 /* ------------------------------------------------------------------ */
-export function CalendarView({ allExp, credits, categories, expenses, cardDue, balances, catById, selMonth, sym }) {
+export function CalendarView({ allExp, credits, categories, expenses, cardDue, balances, catById, selMonth, sym, stmtsComplete = true }) {
   const [mode, setMode] = useState("month");
   const [day, setDay] = useState(null);
   const dates = periodDates(selMonth);
@@ -357,7 +357,7 @@ export function CalendarView({ allExp, credits, categories, expenses, cardDue, b
   });
   const inc = {};
   credits.forEach((c) => { if (periodOf(c.date) === selMonth && isIncome(c.kind)) inc[c.date] = (inc[c.date] || 0) + c.amount; });
-  const bills = billsForMonth({ categories, expenses, credits, cardDue, balances, selMonth }).filter((b) => b.date);
+  const bills = billsForMonth({ categories, expenses, credits, cardDue, balances, selMonth, stmtsComplete }).filter((b) => b.date);
   const billsOn = {}; bills.forEach((b) => (billsOn[b.date] = billsOn[b.date] || []).push(b));
   const vals = Object.values(spend); const max = Math.max(...vals, 1);
   const today = todayIso();
