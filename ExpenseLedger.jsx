@@ -1031,7 +1031,7 @@ export default function ExpenseLedger() {
       )}
 
       {importOpen && (
-        <ImportWizard categories={categories} sym={sym} merchantMap={merchantMap} existing={expenses}
+        <ImportWizard categories={categories} sym={sym} merchantMap={merchantMap} existing={expenses} stmts={stmts}
           existingCredits={credits} creditMap={creditMap}
           onClose={() => setImportOpen(false)} onImport={onImport} />
       )}
@@ -1879,7 +1879,7 @@ function CatSelect({ categories, value, onChange, hint }) {
 /* OLE compound file (D0 CF 11 E0): a legacy .xls, or an encrypted .xlsx wrapper. */
 const isOleFile = (buf) => { const b = new Uint8Array(buf, 0, Math.min(8, buf.byteLength)); return b[0] === 0xd0 && b[1] === 0xcf && b[2] === 0x11 && b[3] === 0xe0; };
 const fileToB64 = (f) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.onerror = () => rej(r.error); r.readAsDataURL(f); });
-function ImportWizard({ categories, sym, merchantMap, existing, existingCredits = [], creditMap = {}, onClose, onImport }) {
+function ImportWizard({ categories, sym, merchantMap, existing, existingCredits = [], creditMap = {}, stmts = {}, onClose, onImport }) {
   const [step, setStep] = useState("upload");
   const [viaAPI, setViaAPI] = useState(false);
   const [fileName, setFileName] = useState("");
@@ -2030,10 +2030,11 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
     setErr(""); setFileName(file.name); setBankSource(bank);
     setStep("loading"); setProgress("Opening " + file.name + "…");
     try {
-      const b64 = await fileToB64(file);
+      // A Drive file is fetched by the server; a local file is sent as base64.
+      const src = file.driveId ? { driveFileId: file.driveId } : { file: await fileToB64(file) };
       const ex = await api("/api/extract", {
         method: "POST",
-        body: JSON.stringify({ file: b64, password: password || "", bank, filename: file.name,
+        body: JSON.stringify({ ...src, password: password || "", bank, filename: file.name,
                                yearHint: new Date().getFullYear() }),
       });
       setDiag(ex.diagnostics || null);
@@ -2103,6 +2104,22 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
     if (pwdKey && pwd) { try { localStorage.setItem(pwdKey, pwd); } catch {} }
     await importStatement(f, bank, pwd);
   };
+
+  /* Google Drive: Statements/<YYYY-MM>/ — listed by the server, one click per file. */
+  const prevMonth = () => { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - 1); return d.toISOString().slice(0, 7); };
+  const [drvMonth, setDrvMonth] = useState(prevMonth);
+  const [drv, setDrv] = useState(null); // { loading, error, hint, files, folderFound }
+  const [drvBank, setDrvBank] = useState({});
+  const loadDrive = async (m) => {
+    setDrv({ loading: true });
+    try {
+      const j = await api("/api/drive?month=" + encodeURIComponent(m || drvMonth));
+      if (!j.ok) { setDrv({ error: j.error, notConfigured: j.notConfigured }); return; }
+      setDrvBank(Object.fromEntries((j.files || []).map((f) => [f.id, f.bank || ""])));
+      setDrv(j);
+    } catch (e) { setDrv({ error: String(e.message || e) }); }
+  };
+  const importFromDrive = (f) => importStatement({ name: f.name, driveId: f.id }, drvBank[f.id], "");
 
   const handleSBIFile = onBankFile(sbiOwner, sbiPwd, `ledger:${sbiOwner}Pwd`);
   const handleUBIFile = onBankFile("ubi", ubiPwd, "ledger:ubiPwd", true);
@@ -2240,6 +2257,48 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
 
         {step === "upload" && (
           <div className="imp-body">
+            <div className="sbi-block" style={{ marginBottom: 14 }}>
+              <div className="sbi-title"><FileSpreadsheet size={15} /> From Google Drive · Statements folder</div>
+              <div className="sbi-row" style={{ flexWrap: "wrap", gap: 8 }}>
+                <input type="month" className="sbi-pwd" style={{ flex: "0 0 auto", width: "auto" }} value={drvMonth}
+                       onChange={(e) => { setDrvMonth(e.target.value); setDrv(null); }} />
+                <button className="sbi-upload-btn" onClick={() => loadDrive()} disabled={drv?.loading}>
+                  {drv?.loading ? "Looking…" : "Find statements"}
+                </button>
+              </div>
+              {drv?.error && <div className="imp-note"><Info size={14} /> {drv.error}</div>}
+              {drv?.ok && !drv.folderFound && (
+                <div className="imp-note"><Info size={14} /> No “{drvMonth}” folder in Drive yet.{drv.hint ? " " + drv.hint : ""}</div>
+              )}
+              {drv?.ok && drv.folderFound && !drv.files.length && <div className="imp-note"><Info size={14} /> The “{drvMonth}” folder is empty.</div>}
+              {drv?.ok && drv.files?.length > 0 && (
+                <div style={{ display: "grid", gap: 6, marginTop: 8 }}>
+                  {drv.files.map((f) => {
+                    const done = (stmts[drvMonth] || []).includes(drvBank[f.id]);
+                    return (
+                      <div key={f.id} className="sbi-row" style={{ flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+                        <span style={{ flex: "1 1 140px", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={f.name}>
+                          {f.name}{done ? " ✓" : ""}
+                        </span>
+                        <select className="sbi-pwd" style={{ flex: "0 0 auto", width: "auto" }} value={drvBank[f.id] || ""}
+                                onChange={(e) => setDrvBank((b) => ({ ...b, [f.id]: e.target.value }))}>
+                          <option value="">— account —</option>
+                          <BankOptions list={STMT_BANKS} />
+                        </select>
+                        <button className="sbi-upload-btn" disabled={!drvBank[f.id]} onClick={() => importFromDrive(f)}>Import</button>
+                      </div>
+                    );
+                  })}
+                  {(() => {
+                    const have = new Set(Object.values(drvBank).filter(Boolean));
+                    const miss = STMT_BANKS.filter((b) => !have.has(b.key)).map((b) => b.label);
+                    return miss.length ? <div className="imp-note"><Info size={14} /> Not in Drive for {drvMonth}: {miss.join(", ")}</div> : null;
+                  })()}
+                </div>
+              )}
+              <div className="imp-note"><Info size={14} /> Passwords come from Vercel. Pick the account if the guess is wrong, then Import — you review each statement as usual.</div>
+            </div>
+            <div className="imp-divider">or upload a file</div>
             <div className="sbi-row" style={{ flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
               <span className="person-label" style={{ fontWeight: 600 }}>Account for this file:</span>
               <select className="sbi-pwd" style={{ flex: "0 0 auto", width: "auto" }} value={genericBank} onChange={(e) => setGenericBank(e.target.value)}>
