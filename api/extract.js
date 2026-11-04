@@ -5,6 +5,7 @@ import { readJsonBody } from "./_lib/blob.js";
 import { summarizeStatement } from "./_lib/summary.js";
 import { askClaude } from "./_lib/ai.js";
 import { sniff, isSheetKind, parseSpreadsheet, rowsToCSV } from "./_lib/sheet.js";
+import { downloadStatement, DriveNotConfigured } from "./_lib/gdrive.js";
 
 /*
  * POST /api/extract
@@ -84,10 +85,19 @@ export default async function handler(req, res) {
   const t0 = Date.now();
   try {
     const body = await readJsonBody(req);
-    const b64 = String(body.file || "").replace(/^data:[^,]+,/, "");
-    if (!b64) { res.status(400).json({ ok: false, error: "No file supplied." }); return; }
-
-    const bytes = Buffer.from(b64, "base64");
+    let bytes;
+    if (body.driveFileId) {
+      // Pulled straight from the Statements folder in Google Drive.
+      try { bytes = (await downloadStatement(body.driveFileId)).bytes; }
+      catch (e) {
+        res.status(e instanceof DriveNotConfigured ? 400 : 502).json({ ok: false, error: String(e.message || e) });
+        return;
+      }
+    } else {
+      const b64 = String(body.file || "").replace(/^data:[^,]+,/, "");
+      if (!b64) { res.status(400).json({ ok: false, error: "No file supplied." }); return; }
+      bytes = Buffer.from(b64, "base64");
+    }
     if (!bytes.length) { res.status(400).json({ ok: false, error: "That file didn't decode." }); return; }
     if (bytes.length > MAX_BYTES) {
       res.status(413).json({ ok: false, error: `That file is ${(bytes.length/1048576).toFixed(1)} MB — too large to process. Split it or export a CSV.` });
