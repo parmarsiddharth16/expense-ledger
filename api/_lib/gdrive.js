@@ -21,17 +21,38 @@ const API = "https://www.googleapis.com/drive/v3";
 
 export class DriveNotConfigured extends Error {}
 
-function loadKey() {
-  const raw = String(process.env.GOOGLE_SA_KEY || "").trim();
-  if (!raw) throw new DriveNotConfigured("Google Drive isn't connected yet — GOOGLE_SA_KEY is not set in Vercel.");
-  let json = raw;
-  if (!raw.startsWith("{")) {
-    try { json = Buffer.from(raw, "base64").toString("utf8"); } catch {}
+function parseKey(raw) {
+  // Tolerate how the JSON tends to arrive after a paste: a byte-order mark,
+  // surrounding quotes, the JSON stored as a JSON string, or base64 of it.
+  let s = String(raw || "").replace(/^\uFEFF/, "").trim();
+  const tries = [s];
+  if (/^(['"]).*\1$/s.test(s)) tries.push(s.slice(1, -1).trim());
+  if (!s.startsWith("{")) { try { tries.push(Buffer.from(s, "base64").toString("utf8").replace(/^\uFEFF/, "").trim()); } catch {} }
+  for (const t of tries) {
+    try {
+      let k = JSON.parse(t);
+      if (typeof k === "string") k = JSON.parse(k);
+      if (k && typeof k === "object") return k;
+    } catch {}
   }
-  let k;
-  try { k = JSON.parse(json); } catch { throw new DriveNotConfigured("GOOGLE_SA_KEY in Vercel isn't valid service-account JSON."); }
-  if (!k.client_email || !k.private_key) throw new DriveNotConfigured("GOOGLE_SA_KEY is missing client_email or private_key.");
-  return { email: k.client_email, key: k.private_key.replace(/\\n/g, "\n") };
+  return null;
+}
+
+function describe(raw) {
+  // Shape only — never any of the value itself.
+  const s = String(raw || "").trim();
+  const start = s.startsWith("{") ? "starts with {" : s.startsWith('"') ? "starts with a quote" : "doesn't start with {";
+  const end = s.endsWith("}") ? "ends with }" : "doesn't end with }";
+  return `${s.length} characters, ${start}, ${end}`;
+}
+
+function loadKey() {
+  const raw = String(process.env.GOOGLE_SA_KEY || "");
+  if (!raw.trim()) throw new DriveNotConfigured("Google Drive isn't connected yet — GOOGLE_SA_KEY is not set in Vercel.");
+  const k = parseKey(raw);
+  if (!k) throw new DriveNotConfigured(`GOOGLE_SA_KEY in Vercel isn't valid service-account JSON (${describe(raw)}). Paste the whole contents of the downloaded .json key file.`);
+  if (!k.client_email || !k.private_key) throw new DriveNotConfigured("GOOGLE_SA_KEY is missing client_email or private_key — is it the service-account key file?");
+  return { email: k.client_email, key: String(k.private_key).replace(/\\n/g, "\n") };
 }
 
 export function serviceAccountEmail() {
