@@ -46,6 +46,19 @@ export function classifyCredit(t, { creditMap = {}, expenses = [] } = {}) {
 
   if (modeOf(t.bank) === "card") {
     if (has(/REFUND|REVERSAL|REVERSED|CASHBACK|CASH BACK|RETURN/)) return { kind: "refund", reason: "refund on the card" };
+    // A credit naming a merchant you spent with on this card is a refund even
+    // when the bank doesn't say so (HDFC prints just "ZOMATOGURGAON" + ₹1,205.19).
+    const day = Date.parse(t.date);
+    if (!has(/PAYMENT|PAYZAPP|AUTOPAY|NEFT|IMPS|BILLDESK|BBPS|THANK/)) {
+      const near = (e, days) => e.bank === t.bank && Math.abs(Date.parse(e.date) - day) <= days * 864e5;
+      const spent = key && expenses.find((e) => near(e, 60) && merchantKey(String(e.note || e.desc || "").toUpperCase()) === key);
+      if (spent) return { kind: "refund", reason: "same merchant as a spend on this card" };
+      // the bank may name the reversal differently (ZEPTO909NPLCYBS vs ZEPTO MARKETPLACE):
+      // same first word and the exact amount of a recent spend is still a refund
+      const word = (s) => (String(s || "").toUpperCase().replace(/^\d{1,2}:\d{2}\s+/, "").match(/[A-Z]{3,}/) || [""])[0].slice(0, 5);
+      const same = expenses.find((e) => near(e, 15) && Math.abs(e.amount - t.amount) < 0.01 && word(e.note || e.desc) && word(e.note || e.desc) === word(d));
+      if (same) return { kind: "refund", reason: "reverses a spend of the same amount on this card" };
+    }
     return { kind: "card_payment", reason: "credit on a card statement = bill paid" };
   }
   if (key && creditMap[key]) return { kind: creditMap[key], reason: "you filed this payer before" };

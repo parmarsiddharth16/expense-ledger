@@ -1925,11 +1925,11 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
   const [credCats, setCredCats] = useState({});
   const [stmtSummary, setStmtSummary] = useState(null);
   const existingCreditKeys = useMemo(() => new Set(existingCredits.map(creditDupKey)), [existingCredits]);
-  const stageCredits = (list, bank) => {
+  const stageCredits = (list, bank, batch = []) => {
     const k = {}, inc = {}, dp = {}, cc = {};
     const out = list.map((t, i) => {
       const key = "c" + i;
-      const cls = classifyCredit({ ...t, bank }, { creditMap, expenses: existing || [] });
+      const cls = classifyCredit({ ...t, bank }, { creditMap, expenses: [...(existing || []), ...batch] });
       if (cls.kind === "refund") cc[key] = guessRefundCat(t.desc, existing);
       const isDup = existingCreditKeys.has(creditDupKey({ ...t, note: t.desc, bank }));
       k[key] = cls.kind; inc[key] = !isDup; dp[key] = isDup;
@@ -2046,7 +2046,8 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
         setStep("upload");
         return;
       }
-      stageCredits(creds.map((t) => ({ date: t.date, desc: t.description, amount: t.amount })), bank);
+      stageCredits(creds.map((t) => ({ date: t.date, desc: t.description, amount: t.amount })), bank,
+        debits.map((t) => ({ date: t.date, note: t.description, amount: t.amount, bank })));
       // Statement figures for the balances card: closing balance = the last
       // running balance in the statement; card dues come from the summary box.
       {
@@ -2148,7 +2149,7 @@ function ImportWizard({ categories, sym, merchantMap, existing, existingCredits 
       if (!isNaN(amount) && amount > 0) out.push({ key: r, date, desc, amount });
       else if (!isNaN(credit) && credit > 0 && date) creds.push({ date, desc, amount: credit });
     }
-    stageCredits(creds, bankSource);
+    stageCredits(creds, bankSource, out.map((t) => ({ date: t.date, note: t.desc, amount: t.amount, bank: bankSource })));
     toReview(out, false, creds.length > 0);
   };
 

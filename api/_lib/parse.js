@@ -30,8 +30,11 @@ const LEAD_SERIAL_RE = /^\d{1,4}\s+(?=\d{1,2}[/\-. ](?:\d{1,2}|[A-Za-z]{3,4})[/\
 /** "1,24,880.00" | "(1,250.00)" | "742.00Cr" → { value, cr, dr } ; null if not money */
 function money(tok) {
   let s = String(tok).trim();
-  let cr = false, dr = false;
+  let cr = false, dr = false, plus = false;
   if (/^\(.*\)$/.test(s)) { dr = true; s = s.slice(1, -1); }
+  // HDFC's card statements print credits as "+ ₹1,205.19" (green); a leading
+  // "+" is a credit marker, not part of the number.
+  if (/^\+/.test(s)) { plus = true; s = s.slice(1).trim(); }
   const m = s.match(/(cr|dr)\.?$/i);
   if (m) {
     if (m[1].toLowerCase() === "cr") cr = true; else dr = true;
@@ -42,7 +45,7 @@ function money(tok) {
   if (!/^\d+(?:\.\d{1,2})?$/.test(s)) return null;
   const value = parseFloat(s);
   if (!isFinite(value)) return null;
-  return { value, cr, dr, decimals: /\./.test(s) };
+  return { value, cr, dr, plus, decimals: /\./.test(s) };
 }
 
 function parseDate(str, yearHint) {
@@ -71,10 +74,12 @@ function isReference(t) {
 /** Every money token on a line, each with its own x span. */
 function moneyTokens(line) {
   const out = [];
+  let plusNext = false;   // a lone "+" (credit) waiting for its number
   for (const it of line.items) {
     const whole = it.str.trim();
     const parts = whole.split(/\s+/);
     if (parts.length === 1) {
+      if (whole === "+") { plusNext = true; continue; }   // "+" item, then "₹ 1,205.19"
       if (/^(cr|dr)\.?$/i.test(whole) && out.length) {
         // a lone "Cr"/"Dr" item: mark the number just before it
         const prev = out[out.length - 1];
@@ -82,14 +87,21 @@ function moneyTokens(line) {
         continue;
       }
       const m = money(whole);
-      if (m) out.push({ ...m, x: it.x, right: it.x + it.w, str: whole });
+      if (m) {
+        if (plusNext) m.plus = true;
+        out.push({ ...m, x: it.x, right: it.x + it.w, str: whole });
+      }
+      if (whole !== "₹") plusNext = false;
       continue;
     }
     const per = it.w / Math.max(1, whole.length);
     let off = 0;
     for (let k = 0; k < parts.length; k++) {
       const p = parts[k];
+      if (p === "+") { plusNext = true; off += p.length + 1; continue; }   // "+ ₹ 1,205.19"
       const m = money(p);
+      if (m && plusNext) m.plus = true;
+      if (!/^(₹|rs\.?|inr)$/i.test(p)) plusNext = false;
       if (m) {
         const tok = { ...m, x: it.x + off * per, right: it.x + (off + p.length) * per, str: p };
         // "25,000.00 Cr" — the marker is its own word but belongs to the number
@@ -107,6 +119,8 @@ function moneyTokens(line) {
 }
 
 const NOISE_RE = /^(opening|closing)\s+balance|^b\/?f\b|^c\/?f\b|^totals?\b|^grand\s+total|^sub\s*total|^statement\s+(period|of|summary|date)|^page\s+\d|^balance\s+(brought|carried)|^(minimum|total)\s+amount\s+due|^credit\s+limit|^available\s+(credit|cash)/i;
+
+const PLUS_TAIL = /\s\+\s*(?:₹|C)?$/;
 
 const CREDIT_HINT = /\b(payment\s+received|received\s*-?\s*thank|refund(ed)?|reversal|reversed|cashback|by\s+transfer|neft\s*cr|imps\s*cr|upi\/cr|salary|interest\s+credit|dividend|credit\s+adjustment)\b/i;
 
@@ -269,14 +283,22 @@ export function parseStatement(lines, opts = {}) {
     desc = desc.replace(/^[\s|:-]+/, "").replace(/[\s.|-]+$/, "").trim();
 
     let debit = 0, credit = 0, balance = null, amount = null, amountCr = false;
+    // HDFC card statements print a credit as "+ ₹1,205.19"; the "+" (and the
+    // rupee glyph, which some fonts extract as "C") lands at the end of the
+    // narration. A reward-points "+ 20" is followed by digits, so it never matches.
+    // Only trusted on single-amount (card) layouts — see the amount role below.
+    const plusTail = PLUS_TAIL.test(desc);
+    if (plusTail) desc = desc.replace(PLUS_TAIL, "").trim();
     for (const t of hit.toks) {
       const c = colFor(t);
       const role = c ? c.role : null;
       if (role === "balance") balance = t.value;
       else if (role === "debit") debit = t.value;
       else if (role === "credit") credit = t.value;
-      else if (role === "amount") { amount = t.value; amountCr = t.cr; }
+      else if (role === "amount") { amount = t.value; amountCr = amountCr || t.cr || plusTail; }
       if (t.cr) amountCr = true;
+      // a "+" only means credit on a money column, never on a number in the narration
+      if (t.plus && role && role !== "balance") amountCr = true;
     }
     if (!debit && !credit && amount === null) continue;
 
